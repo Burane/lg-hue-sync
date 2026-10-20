@@ -27,7 +27,9 @@ use capture::{
 };
 use color::{RgbColor, ZoneSampler};
 use config::{Config, ConfigError};
-use hue::{sync_entertainment_areas, HueDtlsClient, HueStreamPacketBuilder};
+use hue::{
+    reconnect::HueReconnect, sync_entertainment_areas, HueDtlsClient, HueStreamPacketBuilder,
+};
 use nanoleaf::{NanoleafPerimeterSampler, NanoleafUdpStreamer};
 use runtime::{PendingCommands, PipelineState, RetryState};
 use setup::{run_pair, run_pair_nanoleaf, run_sync_hue};
@@ -136,6 +138,31 @@ fn set_hue_stream_active(config: &Config, active: bool) -> Result<()> {
         config.hue_bridge_certificate_sha256.as_deref(),
         active,
     )
+}
+
+fn query_hue_status(config: &Config) -> Result<hue::StreamState> {
+    let id = hue_configuration_id(config)
+        .ok_or_else(|| anyhow!("Hue V2 Entertainment configuration has not been selected"))?;
+    hue::get_stream_state(
+        &config.bridge_ip,
+        &config.username,
+        &id,
+        config.hue_bridge_certificate_sha256.as_deref(),
+    )
+}
+
+fn poll_hue_status(
+    worker: &mut HueReconnect<hue::StreamState>,
+    config: &Config,
+    last_poll: &mut tokio::time::Instant,
+    interval: Duration,
+) -> Option<hue::StreamState> {
+    let result = worker.poll().and_then(Result::ok);
+    if !worker.pending() && last_poll.elapsed() >= interval {
+        worker.request(Some(config));
+        *last_poll = tokio::time::Instant::now();
+    }
+    result
 }
 
 fn calibration_pattern(state: &SharedState) -> Option<CalibrationPattern> {
@@ -396,12 +423,13 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
     // 1. Initialize Philips Hue DTLS client if active
     let mut hue_sync_enabled = config.hue_sync_enabled;
     let mut nanoleaf_sync_enabled = config.nanoleaf_sync_enabled;
-    let mut hue_dtls = if hue_active && hue_sync_enabled && pipeline_should_run {
-        let client = reconnect_hue(&config)?;
-        Some(client)
-    } else {
-        None
-    };
+    let mut hue_dtls = None;
+    let mut hue_reconnect =
+        HueReconnect::new(reconnect_hue, |config| set_hue_stream_active(config, false))?;
+    let mut hue_status = HueReconnect::new(query_hue_status, |_| Ok(()))?;
+    if hue_active && hue_sync_enabled && pipeline_should_run {
+        hue_reconnect.request(Some(&config));
+    }
 
     let mut hue_sampler = if hue_active {
         Some(ZoneSampler::new(
@@ -658,29 +686,29 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
         let web_stop_requested = pending_commands.take_stop_if_running(pipeline_state);
         let mut external_stop = false;
 
-        // Periodically verify if the user stopped sync from the official Hue mobile app (every 5s)
-        if last_status_check.elapsed() >= Duration::from_secs(5) {
-            last_status_check = tokio::time::Instant::now();
-            if hue_active && hue_sync_enabled && hue_dtls.is_some() {
-                if let Some(configuration_id) = hue_configuration_id(&config) {
-                    if let Ok(state) = hue::get_stream_state(
-                        &config.bridge_ip,
-                        &config.username,
-                        &configuration_id,
-                        config.hue_bridge_certificate_sha256.as_deref(),
-                    ) {
-                        if !state.active {
-                            external_stop = true;
-                        }
-                        if let Some(ref mut s) = hue_sampler {
-                            s.set_smoothing_factor(state.smoothing_factor);
-                        }
-                        if let Some(ref mut ns) = nanoleaf_sampler {
-                            ns.set_smoothing_factor(state.smoothing_factor);
-                        }
-                    }
+        // Bridge reads run on their own worker; only current-session results affect output.
+        if hue_active
+            && hue_sync_enabled
+            && hue_dtls.is_some()
+            && !web_stop_requested
+            && !pending_commands.has_management_action()
+        {
+            if let Some(state) = poll_hue_status(
+                &mut hue_status,
+                &config,
+                &mut last_status_check,
+                Duration::from_secs(5),
+            ) {
+                external_stop = !state.active;
+                if let Some(ref mut sampler) = hue_sampler {
+                    sampler.set_smoothing_factor(state.smoothing_factor);
+                }
+                if let Some(ref mut sampler) = nanoleaf_sampler {
+                    sampler.set_smoothing_factor(state.smoothing_factor);
                 }
             }
+        } else {
+            hue_status.request(None);
         }
 
         if web_stop_requested || external_stop || pipeline_state == PipelineState::Paused {
@@ -691,12 +719,8 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
             shared_state.is_syncing.store(false, Ordering::SeqCst);
             pipeline_state = PipelineState::Paused;
 
-            // Deactivate Hue stream on bridge if web requested stop
-            if (web_stop_requested || (auto_tv_power && observed_tv_power == Some(false)))
-                && hue_active
-            {
-                let _ = set_hue_stream_active(&config, false);
-            }
+            hue_status.request(None);
+            hue_reconnect.request(None);
             hue_dtls = None;
             shared_state.hue_connected.store(false, Ordering::Relaxed);
 
@@ -764,48 +788,32 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                         }
                     }
                 }
-                let mut app_reactivated = false;
-                if !start_requested
+                let app_reactivated = if !start_requested
+                    && requested_running != Some(false)
                     && hue_active
+                    && hue_sync_enabled
+                    && hue_reconnect.is_settled()
                     && !(auto_tv_power && observed_tv_power == Some(false))
                 {
-                    if let Some(configuration_id) = hue_configuration_id(&config) {
-                        if let Ok(st) = hue::get_stream_state(
-                            &config.bridge_ip,
-                            &config.username,
-                            &configuration_id,
-                            config.hue_bridge_certificate_sha256.as_deref(),
-                        ) {
-                            if st.active {
-                                app_reactivated = true;
-                            }
-                        }
-                    }
-                }
+                    poll_hue_status(
+                        &mut hue_status,
+                        &config,
+                        &mut last_status_check,
+                        watchdog.pause_poll_period(),
+                    )
+                    .is_some_and(|state| state.active)
+                } else {
+                    hue_status.request(None);
+                    false
+                };
 
                 if start_requested || app_reactivated {
+                    hue_status.request(None);
                     info!(
                         "Sync resume requested! Reactivating Hue & Nanoleaf streaming sessions..."
                     );
-                    let mut hue_resumed = !hue_active || !hue_sync_enabled;
                     if hue_active && hue_sync_enabled {
-                        match reconnect_hue(&config) {
-                            Ok(client) => {
-                                info!("[+] Re-established Hue DTLS streaming session.");
-                                hue_dtls = Some(client);
-                                shared_state.hue_connected.store(true, Ordering::Relaxed);
-                                hue_resumed = true;
-                            }
-                            Err(e) => {
-                                error!("Failed to re-establish Hue DTLS streaming session: {}", e);
-                                shared_state.hue_connected.store(false, Ordering::Relaxed);
-                            }
-                        }
-                    }
-
-                    if !hue_resumed {
-                        shared_state.is_syncing.store(false, Ordering::SeqCst);
-                        continue;
+                        hue_reconnect.request(Some(&config));
                     }
 
                     shared_state.is_syncing.store(true, Ordering::SeqCst);
@@ -869,25 +877,17 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
             current_use_xy = live_st.use_xy_gamut;
             *shared_state.hue_zones.write().unwrap() = config.zones.clone();
             if hue_sync_enabled != live_st.hue_sync_enabled {
+                hue_status.request(None);
                 hue_sync_enabled = live_st.hue_sync_enabled;
-                if hue_sync_enabled && pipeline_state == PipelineState::Running {
-                    match reconnect_hue(&config) {
-                        Ok(client) => {
-                            hue_dtls = Some(client);
-                            shared_state.hue_connected.store(true, Ordering::Relaxed);
-                        }
-                        Err(error) => {
-                            hue_sync_enabled = false;
-                            shared_state.hue_connected.store(false, Ordering::Relaxed);
-                            warn!("Hue sync remains off: {}", error);
-                        }
-                    }
-                } else {
-                    let _ = set_hue_stream_active(&config, false);
-                    hue_dtls = None;
-                    shared_state.hue_connected.store(false, Ordering::Relaxed);
-                }
+                hue_dtls = None;
+                shared_state.hue_connected.store(false, Ordering::Relaxed);
+                hue_retry.success();
+                hue_reconnect.request(
+                    (hue_sync_enabled && pipeline_state == PipelineState::Running)
+                        .then_some(&config),
+                );
             }
+
             if nanoleaf_sync_enabled != live_st.nanoleaf_sync_enabled {
                 nanoleaf_sync_enabled = live_st.nanoleaf_sync_enabled;
                 if nanoleaf_sync_enabled && pipeline_state == PipelineState::Running {
@@ -1018,9 +1018,6 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                 Ok(area) if !area.zones.is_empty() => {
                     let configuration_changed = config.entertainment_configuration_id.as_deref()
                         != Some(&area.configuration_id);
-                    if configuration_changed {
-                        let _ = set_hue_stream_active(&config, false);
-                    }
                     config.entertainment_area_id = area.configuration_id.clone();
                     config.entertainment_configuration_id = Some(area.configuration_id);
                     config.hue_bridge_certificate_sha256 = Some(area.certificate_sha256);
@@ -1047,22 +1044,18 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                         sampler.set_max_color_step(live_st.max_color_step);
                     }
                     if configuration_changed {
+                        hue_status.request(None);
                         hue_packet_builder =
                             Some(HueStreamPacketBuilder::new(hue_configuration_id(&config)));
-                        if hue_sync_enabled && pipeline_state == PipelineState::Running {
-                            match reconnect_hue(&config) {
-                                Ok(client) => {
-                                    hue_dtls = Some(client);
-                                    shared_state.hue_connected.store(true, Ordering::Relaxed);
-                                }
-                                Err(error) => {
-                                    hue_dtls = None;
-                                    shared_state.hue_connected.store(false, Ordering::Relaxed);
-                                    warn!("Hue area changed but DTLS rebind failed: {}", error);
-                                }
-                            }
-                        }
+                        hue_dtls = None;
+                        shared_state.hue_connected.store(false, Ordering::Relaxed);
+                        hue_retry.success();
+                        hue_reconnect.request(
+                            (hue_sync_enabled && pipeline_state == PipelineState::Running)
+                                .then_some(&config),
+                        );
                     }
+
                     if let Err(error) = Config::update(&config_path, None, |current| {
                         if (
                             current.bridge_ip.as_str(),
@@ -1100,6 +1093,36 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                 ),
                 Err(e) => warn!("Hue bridge sync failed; leaving zones unchanged: {}", e),
             }
+        }
+
+        if let Some(result) = hue_reconnect.poll() {
+            match result {
+                Ok(client)
+                    if hue_active
+                        && hue_sync_enabled
+                        && pipeline_state == PipelineState::Running =>
+                {
+                    hue_status.request(None);
+                    hue_dtls = Some(client);
+                    hue_retry.success();
+                    shared_state.hue_connected.store(true, Ordering::Relaxed);
+                    info!("[+] Re-established Hue DTLS streaming session.");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let delay = hue_retry.failure();
+                    warn!("Hue reconnect failed: {error:#}. Retrying in {delay:?}.");
+                }
+            }
+        }
+        if hue_active
+            && hue_sync_enabled
+            && pipeline_state == PipelineState::Running
+            && hue_dtls.is_none()
+            && !hue_reconnect.pending()
+            && hue_retry.ready()
+        {
+            hue_reconnect.request(Some(&config));
         }
 
         // 4. Check for pipeline restart request from Web UI
@@ -1286,26 +1309,7 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                             if let Err(e) = dtls.send(&packet) {
                                 shared_state.hue_connected.store(false, Ordering::Relaxed);
                                 error!("Failed to send DTLS HueStream packet: {}", e);
-                                if hue_retry.ready() {
-                                    match reconnect_hue(&config) {
-                                        Ok(new_dtls) => {
-                                            *dtls = new_dtls;
-                                            hue_retry.success();
-                                            shared_state
-                                                .hue_connected
-                                                .store(true, Ordering::Relaxed);
-                                            info!("[+] Successfully reconnected Hue DTLS session.");
-                                        }
-                                        Err(conn_err) => {
-                                            let delay = hue_retry.failure();
-                                            warn!(
-                                                "DTLS reconnect failed: {}. Retrying in {:.1}s.",
-                                                conn_err,
-                                                delay.as_secs_f32()
-                                            );
-                                        }
-                                    }
-                                }
+                                hue_dtls = None;
                             } else {
                                 hue_retry.success();
                                 shared_state.hue_connected.store(true, Ordering::Relaxed);
@@ -1490,11 +1494,10 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
         }
     }
 
-    // Cleanup: deactivate Hue stream
-    if hue_active {
-        info!("Deactivating entertainment area stream on Hue Bridge...");
-        let _ = set_hue_stream_active(&config, false);
-    }
+    // Join the serial worker after invalidating every in-flight reconnect.
+    drop(hue_dtls);
+    drop(hue_status);
+    drop(hue_reconnect);
 
     signal_task.abort();
     let _ = signal_task.await;
@@ -1705,6 +1708,71 @@ impl WatchdogHeartbeat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn status_poll_stays_nonblocking_and_rejects_old_session_results() {
+        use std::sync::{atomic::AtomicUsize, mpsc as channel};
+        let (started, started_rx) = channel::channel();
+        let (release, release_rx) = channel::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempts = calls.clone();
+        let mut worker = HueReconnect::new(
+            move |config| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                if config.entertainment_area_id == "old" {
+                    started.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                }
+                Ok(hue::StreamState {
+                    active: config.entertainment_area_id == "new",
+                    brightness: 1.0,
+                    smoothing_factor: 0.35,
+                })
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        let old = Config::new_default("", "", "", "old");
+        let interval = Duration::from_secs(5);
+        let mut last_poll = tokio::time::Instant::now() - interval;
+        assert!(poll_hue_status(&mut worker, &old, &mut last_poll, interval).is_none());
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            last_poll = tokio::time::Instant::now() - interval;
+            assert!(poll_hue_status(&mut worker, &old, &mut last_poll, interval).is_none());
+        }
+        assert!(start.elapsed() < Duration::from_millis(500));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        worker.request(None);
+        assert!(!worker.is_settled());
+        last_poll = tokio::time::Instant::now();
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !worker.is_settled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(poll_hue_status(&mut worker, &old, &mut last_poll, interval).is_none());
+        let new = Config::new_default("", "", "", "new");
+        last_poll = tokio::time::Instant::now() - interval;
+        assert!(poll_hue_status(&mut worker, &new, &mut last_poll, interval).is_none());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !worker.is_settled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            poll_hue_status(&mut worker, &new, &mut last_poll, interval)
+                .unwrap()
+                .active
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn duplicate_output_frames_are_suppressed_but_meaningful_changes_pass() {

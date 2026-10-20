@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Run periodic Hue Bridge status polling in a separate worker, reject superseded results, and wait for stop cleanup before checking for app-driven resume.
+- Move Hue reconnect and session cleanup to a serial background worker; discard superseded results and keep Nanoleaf and control processing running while Hue reconnects.
+- Reject malformed Hue client keys without UTF-8 slicing panics, and share a five-second DTLS handshake deadline across retries and socket operations.
+- Bound Nanoleaf pairing requests, response bodies, polling delays and panel-layout retrieval by the remaining pairing deadline.
+
 ## [0.6.1] - 2026-10-08
 
 ### Added

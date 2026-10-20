@@ -16,6 +16,18 @@ Dashboard actions enter the daemon through a bounded typed command channel. `src
 coalesces desired start/stop state while preserving restart, reconfiguration, save, and Bridge
 refresh actions. Runtime output state remains distinct from the persisted configuration.
 
+`src/hue/reconnect.rs` serializes Hue activation, DTLS connection and cleanup on a dedicated
+worker. Generation checks discard results superseded by stop, disable or area changes; retries
+do not block Nanoleaf or command processing. DTLS handshakes share a five-second deadline;
+Bridge HTTP operations retain their five-second deadline. Shutdown joins the worker after
+invalidating pending connections. A separate instance of the same worker handles periodic
+Bridge status reads in running and paused states. Only one read is pending at a time;
+stop, resume, disable and area changes invalidate old results. Paused auto-resume waits for
+session cleanup to settle before querying the Bridge. Explicit area-refresh requests still
+run synchronously in the daemon loop.
+Nanoleaf pairing limits each HTTP request to three seconds or the remaining pairing budget,
+whichever is shorter, including response bodies and the subsequent panel-layout request.
+
 Hue and Nanoleaf sampling share `ColorProcessor` for peak weighting, noise gating, saturation,
 gamma, the legacy midtone lift, temporal response, strict black, and scene-change limits.
 Spatial averages, colour transforms, and temporal state retain fractional RGB until output rounding.

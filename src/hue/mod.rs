@@ -1,4 +1,5 @@
 pub mod dtls;
+pub mod reconnect;
 pub mod stream;
 
 use anyhow::{anyhow, Context, Result};
