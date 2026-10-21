@@ -32,3 +32,9 @@ dejavuln_payload/
 
 # Generated from the current user's private Hue Entertainment Area layout
 /calibration-patterns/local/
+
+# Extracted third-party app bundles for capture research (proprietary, never commit)
+/analysis/
+
+# Superpowers plan execution scratch (ledgers, briefs, review packages)
+/.superpowers/
