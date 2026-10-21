@@ -1,4 +1,5 @@
 pub mod dile_vt;
+pub mod histogram_types;
 pub mod vtcapture;
 
 use std::time::{Duration, Instant};
