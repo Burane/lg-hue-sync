@@ -1,39 +1,43 @@
 // -----------------------------------------------------------------------------
-// webOS 24/25 Histogram Capture Backend (reverse-engineered libvtcapture API)
+// webOS 25 Histogram Capture Backend (direct V4L2 ioctls on /dev/video60)
 // -----------------------------------------------------------------------------
 
 use anyhow::{Context, Result, anyhow, ensure};
-use libloading::{Library, Symbol};
 use std::ffi::c_void;
-use std::path::Path;
-use std::sync::atomic::Ordering;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
-use super::histogram_probe::{REINIT, policy_trampoline, u8_weighted_mean, u16_weighted_mean};
+use super::histogram_probe::{u8_weighted_mean, u16_weighted_mean};
 use super::histogram_types::{
-    HistogramBuffer, LIBVTCAPTURE_PATH, VtHistogramEntry, ZONE_GRID, ZONES_PER_PRESET,
+    CTRL_HISTOGRAM_DATA, CTRL_HISTOGRAM_ENABLE, CTRL_HISTOGRAM_PRESET, ENTRY_SIZE,
+    HISTOGRAM_V4L2_DEVICE, HistogramBuffer, V4l2ExtControl, V4l2ExtControls, VIDIOC_G_EXT_CTRLS,
+    VIDIOC_S_EXT_CTRLS, VtHistogramEntry, ZONE_GRID, ZONES_PER_PRESET, build_ext_controls,
 };
 use super::{CaptureError, CapturedFrame, NativeCaptureError, ScreenCapture};
 
 /// Interpretation of each 512-byte channel block in a histogram entry.
 ///
-/// Evidence (`analysis/findings.md` §3.2) does not settle u8-vs-u16 bin
-/// semantics; both are supported and the choice is a compile-time constant
-/// until the on-device probe finalizes it.
+/// Settled on-device by the C5 probe campaign (analysis/probe-results.md):
+/// each block is 256 little-endian `u16` counts, bin index = level 0-255;
+/// the u8 reading is a misparse artifact of the same bytes. `U8x512` remains
+/// supported as the documented failure mode — `zone_to_rgb` stays total over
+/// the enum and the u8-vs-u16 tests keep locking the distinction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinLayout {
-    /// 512 `u8` bins per channel block.
-    U8x512,
-    /// 256 little-endian `u16` bins per channel block; constructed only by the
-    /// on-device probe once u8-vs-u16 semantics are settled (Task 7).
+    /// 512 `u8` bins per channel block. Refuted on-device; constructed only
+    /// by the tests documenting the misparse.
     #[allow(dead_code)]
+    U8x512,
+    /// 256 little-endian `u16` bins per channel block.
     U16x256,
 }
 
-/// Bin layout used until the on-device probe settles u8 vs u16 (Task 7 finalizes).
-pub const BIN_LAYOUT: BinLayout = BinLayout::U8x512;
+/// Bin layout confirmed on-device (analysis/probe-results.md): 256
+/// little-endian u16 counts per 512-byte channel block.
+pub const BIN_LAYOUT: BinLayout = BinLayout::U16x256;
 
-/// Channel-block index to (R, G, B) mapping (Task 7 finalizes).
+/// Channel-block index to (R, G, B) mapping, confirmed on-device against a
+/// known dark-orange screen (u16 peaks 240/70/21 → RGB(240, 70, 21)):
+/// ch0=R, ch1=G, ch2=B.
 pub const CHANNEL_ORDER: (usize, usize, usize) = (0, 1, 2);
 
 /// Converts one histogram zone into an 8-bit (R, G, B) colour from each
@@ -81,22 +85,65 @@ pub fn zone_to_rgb(
 }
 
 // -----------------------------------------------------------------------------
-// FFI seam (unsafe confined to the dlopen implementation)
+// Capture seam (unsafe confined to the direct V4L2 implementation)
 // -----------------------------------------------------------------------------
 
-/// `bool (*)(void)` policy callback handed to `vtCapture_initHistogram`.
-type HistogramPolicyCallback = unsafe extern "C" fn() -> bool;
-type FnVtCaptureInitHistogram = unsafe extern "C" fn(HistogramPolicyCallback) -> *mut c_void;
-type FnVtCaptureSetPresetHistogram = unsafe extern "C" fn(*mut c_void, i32) -> i32;
-type FnVtCaptureGetHistogram = unsafe extern "C" fn(*mut c_void, *mut VtHistogramEntry) -> i32;
-type FnVtCaptureFinalizeHistogram = unsafe extern "C" fn(*mut c_void) -> i32;
+/// Largest errno the kernel reports to userspace (Linux `MAX_ERRNO`); bounds
+/// the sentinel pointer window.
+const MAX_ERRNO: i32 = 4095;
 
-/// Injectable library seam so host tests can drive the backend without a TV.
+/// Encodes a failed device open as a distinguishable [`HistogramLib::init`]
+/// result: the returned pointer's value is `errno + 1`. The trait's `init`
+/// has no error channel and NULL already means generic failure, so the open
+/// errno — EBUSY in particular, which must surface as `device_busy` — rides
+/// in the handle itself. The value is never dereferenced, only decoded by
+/// [`errno_from_sentinel`].
+fn errno_sentinel(errno: i32) -> *mut c_void {
+    debug_assert!(
+        (1..=MAX_ERRNO).contains(&errno),
+        "sentinel errnos are real kernel errnos"
+    );
+    (errno as usize + 1) as *mut c_void
+}
+
+/// Decodes an [`errno_sentinel`] failure: `Some(errno)` for encoded open
+/// failures, `None` for NULL, real session handles (`Box::into_raw` results,
+/// never inside the tiny window below a page), and the test fake's dangling
+/// address-1 token.
+fn errno_from_sentinel(handle: *mut c_void) -> Option<i32> {
+    let value = handle as usize;
+    if (2..=MAX_ERRNO as usize + 1).contains(&value) {
+        Some((value - 1) as i32)
+    } else {
+        None
+    }
+}
+
+/// Maps a V4L2 ioctl errno onto the native result-code taxonomy the error
+/// handling already speaks — the mapping the C5 probe campaign recorded
+/// (analysis/probe-results.md): `EAGAIN`→11 (frame not ready yet),
+/// `EACCES`→17 (access conflict), `ENODATA`→13 (no data yet), anything
+/// else→1 (undocumented transient). Codes 2 and 3 stay reserved for the
+/// seam's own null-handle / null-buffer results.
+fn map_errno_to_native_code(errno: i32) -> i32 {
+    match errno {
+        libc::EAGAIN => 11,
+        libc::EACCES => 17,
+        libc::ENODATA => 13,
+        _ => 1,
+    }
+}
+
+/// Injectable device seam so host tests can drive the backend without a TV.
 ///
 /// `pub` for visibility-lint coherence within this binary crate; nothing in a
 /// bin target is exported, so the seam never leaves the crate.
 pub trait HistogramLib {
-    /// Arms a histogram session with the policy trampoline; NULL on failure.
+    /// Opens and arms a histogram session: open `/dev/video60`, then the
+    /// enable control (combining the library's ctor and start). Returns the
+    /// opaque session handle; NULL on a failed arm, or an [`errno_sentinel`]
+    /// when the open itself failed (EBUSY is decoded into `device_busy` by
+    /// the construction path).
     fn init(&mut self) -> *mut c_void;
     /// Applies a preset (0..3); native result code.
     fn set_preset(&mut self, handle: *mut c_void, preset: i32) -> i32;
@@ -106,117 +153,202 @@ pub trait HistogramLib {
     fn finalize(&mut self, handle: *mut c_void) -> i32;
 }
 
-/// Real seam: the dlopen'd `/usr/lib/libvtcapture.so.1` histogram API.
-pub struct DlopenHistogramLib {
-    fn_init_histogram: FnVtCaptureInitHistogram,
-    fn_set_preset_histogram: FnVtCaptureSetPresetHistogram,
-    fn_get_histogram: FnVtCaptureGetHistogram,
-    fn_finalize_histogram: FnVtCaptureFinalizeHistogram,
-    _lib: Library,
+/// Per-session state carried in the opaque [`HistogramLib`] handle: the open
+/// device fd plus the zone count the applied preset selected (it sizes the
+/// `G_EXT_CTRLS` payload). Lives entirely in the handle, so the seam itself
+/// stays stateless and `finalize` closes exactly what `init` opened.
+struct V4l2Session {
+    fd: libc::c_int,
+    zones: u32,
 }
 
-impl DlopenHistogramLib {
-    /// Loads the histogram capture API, mirroring `HistogramProbe::try_new`.
-    fn open() -> Result<Self> {
-        if !Path::new(LIBVTCAPTURE_PATH).exists() {
-            return Err(anyhow!(
-                "histogram capture: libvtcapture driver library not found at {}",
-                LIBVTCAPTURE_PATH
-            ));
-        }
-        info!(
-            "Loading webOS histogram capture API from {}...",
-            LIBVTCAPTURE_PATH
-        );
-        // SAFETY: dlopen of the system capture library; failure is reported by
-        // libloading and mapped to an error below.
-        let lib = unsafe { Library::new(LIBVTCAPTURE_PATH) }
-            .map_err(|error| anyhow!("Failed to dlopen {}: {}", LIBVTCAPTURE_PATH, error))?;
+/// Real seam: direct V4L2 ext-controls against `/dev/video60`, bypassing
+/// libvtcapture — whose init is caller-cmdline-whitelisted and whose Luna
+/// resource manager aborts outside a real LS2 service context — while the
+/// kernel serves the controls to a plain root process, confirmed live
+/// including during DRM playback (analysis/probe-results.md).
+pub struct V4l2HistogramLib;
 
-        // SAFETY: symbol resolution against the just-loaded library; the stored
-        // function pointers are only called with the signatures recovered in
-        // `analysis/findings.md` §3.2.
-        unsafe {
-            let fn_init_histogram: Symbol<FnVtCaptureInitHistogram> = lib
-                .get(b"vtCapture_initHistogram\0")
-                .map_err(|error| anyhow!("Symbol vtCapture_initHistogram not found: {}", error))?;
-            let fn_set_preset_histogram: Symbol<FnVtCaptureSetPresetHistogram> = lib
-                .get(b"vtCapture_setPresetHistogram\0")
-                .map_err(|error| {
-                    anyhow!("Symbol vtCapture_setPresetHistogram not found: {}", error)
-                })?;
-            let fn_get_histogram: Symbol<FnVtCaptureGetHistogram> = lib
-                .get(b"vtCapture_getHistogram\0")
-                .map_err(|error| anyhow!("Symbol vtCapture_getHistogram not found: {}", error))?;
-            let fn_finalize_histogram: Symbol<FnVtCaptureFinalizeHistogram> =
-                lib.get(b"vtCapture_finalizeHistogram\0").map_err(|error| {
-                    anyhow!("Symbol vtCapture_finalizeHistogram not found: {}", error)
-                })?;
-
-            Ok(Self {
-                fn_init_histogram: *fn_init_histogram,
-                fn_set_preset_histogram: *fn_set_preset_histogram,
-                fn_get_histogram: *fn_get_histogram,
-                fn_finalize_histogram: *fn_finalize_histogram,
-                _lib: lib,
-            })
-        }
+impl V4l2HistogramLib {
+    /// Builds the stateless seam. Infallible: the node is opened per `init`.
+    fn new() -> Self {
+        Self
     }
 }
 
-impl HistogramLib for DlopenHistogramLib {
+/// Reclaims the session state from a live handle, or `None` for NULL and
+/// failure sentinels (which must never reach the ioctl helpers).
+///
+/// # Safety
+/// `handle` must be a live handle returned by [`HistogramLib::init`] —
+/// non-null, non-sentinel — owned by exactly one capture; the `&mut self`
+/// receiver on every trait method guarantees that exclusivity.
+unsafe fn session(handle: *mut c_void) -> Option<&'static mut V4l2Session> {
+    if handle.is_null() || errno_from_sentinel(handle).is_some() {
+        return None;
+    }
+    // SAFETY: guaranteed by the caller contract above.
+    Some(unsafe { &mut *(handle as *mut V4l2Session) })
+}
+
+/// Opens [`HISTOGRAM_V4L2_DEVICE`] `O_RDWR|O_CLOEXEC`; `Err(errno)` on failure.
+fn open_histogram_device() -> Result<libc::c_int, i32> {
+    let path =
+        std::ffi::CString::new(HISTOGRAM_V4L2_DEVICE).expect("device path is a NUL-free constant");
+    // SAFETY: `path` outlives the call and open() only reads it.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+    }
+    Ok(fd)
+}
+
+/// Runs one `VIDIOC_S_EXT_CTRLS` with the single given control.
+fn set_ctrl(fd: libc::c_int, ctrl: &mut V4l2ExtControl) -> Result<(), i32> {
+    let mut ctrls = build_ext_controls(ctrl);
+    // SAFETY: `ctrls.controls` targets the live `ctrl` for the call's
+    // duration; the kernel only writes back `error_idx`.
+    if unsafe { libc::ioctl(fd, VIDIOC_S_EXT_CTRLS, &mut ctrls as *mut V4l2ExtControls) } < 0 {
+        return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+    }
+    Ok(())
+}
+
+/// Runs one `VIDIOC_G_EXT_CTRLS` reading the `zones`-entry histogram payload
+/// into `buf`.
+fn get_histogram_data(
+    fd: libc::c_int,
+    zones: usize,
+    buf: *mut VtHistogramEntry,
+) -> Result<(), i32> {
+    let mut data = V4l2ExtControl {
+        id: CTRL_HISTOGRAM_DATA,
+        size: (zones * ENTRY_SIZE) as u32,
+        reserved2: 0,
+        // 32-bit ARM target: the pointer fits losslessly; on a 64-bit host
+        // this path is unreachable (the open in init fails first).
+        value_or_ptr: buf as usize as u32,
+        reserved3: 0,
+    };
+    let mut ctrls = build_ext_controls(&mut data);
+    // SAFETY: `ctrls.controls` targets the live payload control; the kernel
+    // writes the histogram into `buf` and `error_idx` only.
+    if unsafe { libc::ioctl(fd, VIDIOC_G_EXT_CTRLS, &mut ctrls as *mut V4l2ExtControls) } < 0 {
+        return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+    }
+    Ok(())
+}
+
+impl HistogramLib for V4l2HistogramLib {
     fn init(&mut self) -> *mut c_void {
-        // SAFETY: the library is loaded and the trampoline is a plain function
-        // with no preconditions.
-        unsafe { (self.fn_init_histogram)(policy_trampoline) }
+        let fd = match open_histogram_device() {
+            Ok(fd) => fd,
+            Err(errno) => return errno_sentinel(errno),
+        };
+        // Mirrors VtHistogram::start: value 0 enables the histogram engine.
+        // This single control combines the library's ctor and start.
+        let mut enable = V4l2ExtControl {
+            id: CTRL_HISTOGRAM_ENABLE,
+            size: 0,
+            reserved2: 0,
+            value_or_ptr: 0,
+            reserved3: 0,
+        };
+        if let Err(errno) = set_ctrl(fd, &mut enable) {
+            warn!(
+                "histogram enable control failed (errno {errno}); closing {}",
+                HISTOGRAM_V4L2_DEVICE
+            );
+            // SAFETY: `fd` is the descriptor just opened above.
+            unsafe { libc::close(fd) };
+            return std::ptr::null_mut();
+        }
+        // Preset-0's zone count is the safe default until set_preset runs;
+        // the construction flow always calls it immediately after init.
+        Box::into_raw(Box::new(V4l2Session {
+            fd,
+            zones: ZONES_PER_PRESET[0] as u32,
+        })) as *mut c_void
     }
 
     fn set_preset(&mut self, handle: *mut c_void, preset: i32) -> i32 {
         // SAFETY: `handle` originates from init() and outlives the call.
-        unsafe { (self.fn_set_preset_histogram)(handle, preset) }
+        let Some(session) = (unsafe { session(handle) }) else {
+            return 2; // null handle / not active, native taxonomy
+        };
+        if !(0..ZONES_PER_PRESET.len() as i32).contains(&preset) {
+            return 3; // bad preset, native taxonomy
+        }
+        let mut ctrl = V4l2ExtControl {
+            id: CTRL_HISTOGRAM_PRESET,
+            size: 0,
+            reserved2: 0,
+            value_or_ptr: preset as u32,
+            reserved3: 0,
+        };
+        match set_ctrl(session.fd, &mut ctrl) {
+            Ok(()) => {
+                session.zones = ZONES_PER_PRESET[preset as usize] as u32;
+                0
+            }
+            Err(errno) => map_errno_to_native_code(errno),
+        }
     }
 
     fn get(&mut self, handle: *mut c_void, buf: *mut VtHistogramEntry) -> i32 {
-        // SAFETY: `buf` points at a caller-owned HistogramBuffer holding one
-        // entry per zone of the active preset.
-        unsafe { (self.fn_get_histogram)(handle, buf) }
+        // SAFETY: `handle` originates from init() and outlives the call.
+        let Some(session) = (unsafe { session(handle) }) else {
+            return 2; // null handle / not active, native taxonomy
+        };
+        if buf.is_null() {
+            return 3; // null buffer, native taxonomy
+        }
+        match get_histogram_data(session.fd, session.zones as usize, buf) {
+            Ok(()) => 0,
+            Err(errno) => map_errno_to_native_code(errno),
+        }
     }
 
     fn finalize(&mut self, handle: *mut c_void) -> i32 {
-        // SAFETY: `handle` originates from init(); the caller clears its stored
-        // handle first so each session is finalized exactly once.
-        unsafe { (self.fn_finalize_histogram)(handle) }
+        if handle.is_null() {
+            return 0; // idempotent: nothing was ever armed
+        }
+        // SAFETY: a non-null, non-sentinel handle is the `Box::into_raw`
+        // pointer from init(); the caller nulls its stored handle first, so
+        // each session is reclaimed exactly once.
+        let session = unsafe { Box::from_raw(handle as *mut V4l2Session) };
+        // SAFETY: `session.fd` is the descriptor opened in init().
+        if unsafe { libc::close(session.fd) } < 0 {
+            return std::io::Error::last_os_error().raw_os_error().unwrap_or(1);
+        }
+        0
     }
 }
 
 // -----------------------------------------------------------------------------
-// Backend: screen capture over the histogram API with a reinit state machine
+// Backend: screen capture over the histogram device
 // -----------------------------------------------------------------------------
 
-/// Reinit attempts made inline per `acquire_frame` before giving up.
-const REINIT_ATTEMPTS: u32 = 3;
-
-/// Maps a failing `vtCapture_setPresetHistogram` result code to a message.
+/// Maps a failing preset result code to a message.
 fn preset_error_context(rc: i32) -> &'static str {
     match rc {
         2 => "histogram mode not activated",
         3 => "bad preset",
-        _ => "vtCapture_setPresetHistogram failed",
+        _ => "histogram set_preset failed",
     }
 }
 
 /// Production capture backend rendering the reverse-engineered webOS
-/// 24/25 histogram API into a `ZONE_GRID` BGRA canvas, one rect per zone.
+/// 25 histogram device into a `ZONE_GRID` BGRA canvas, one rect per zone.
 ///
-/// Generic over the library seam; [`HistogramCapture`] is the production
-/// alias bound to [`DlopenHistogramLib`].
+/// Generic over the device seam; [`HistogramCapture`] is the production
+/// alias bound to [`V4l2HistogramLib`].
 pub struct HistogramCaptureImpl<L: HistogramLib> {
     lib: L,
     /// Live session handle; NULL whenever the session is not armed.
     handle: *mut c_void,
     width: u32,
     height: u32,
-    preset: i32,
     buffer: HistogramBuffer,
     canvas: Vec<u8>,
 }
@@ -229,11 +361,6 @@ impl<L: HistogramLib> HistogramCaptureImpl<L> {
             "bad preset {preset}: histogram presets are 0..{}",
             ZONES_PER_PRESET.len()
         );
-        // A dropped session may have left an unconsumed policy request; a
-        // freshly armed session must not inherit it, or the first
-        // acquire_frame would tear down the session just created. Cleared
-        // before init so a policy event arriving during arming is preserved.
-        REINIT.store(false, Ordering::SeqCst);
         let handle = lib.init();
         if handle.is_null() {
             return Err(anyhow::Error::new(NativeCaptureError {
@@ -241,7 +368,28 @@ impl<L: HistogramLib> HistogramCaptureImpl<L> {
                 operation: "init",
                 code: 0,
             })
-            .context("vtCapture_initHistogram returned NULL"));
+            .context("histogram capture init failed"));
+        }
+        // A failure sentinel means the open itself failed; EBUSY gets its own
+        // distinguishable error because the fix is operator action (freeing
+        // the node), not a restart.
+        if let Some(errno) = errno_from_sentinel(handle) {
+            if errno == libc::EBUSY {
+                error!(
+                    "another process holds {HISTOGRAM_V4L2_DEVICE} (e.g. the official Hue service) — stop it or declare Conflicts in the service unit"
+                );
+                return Err(anyhow::Error::new(NativeCaptureError {
+                    backend: "histogram",
+                    operation: "device_busy",
+                    code: errno,
+                }));
+            }
+            return Err(anyhow::Error::new(NativeCaptureError {
+                backend: "histogram",
+                operation: "init",
+                code: errno,
+            })
+            .context("histogram device open failed"));
         }
         let rc = lib.set_preset(handle, preset);
         if rc != 0 {
@@ -261,47 +409,8 @@ impl<L: HistogramLib> HistogramCaptureImpl<L> {
             handle,
             width,
             height,
-            preset,
             buffer: HistogramBuffer::new(zones),
             canvas: vec![0; width as usize * height as usize * 4],
-        })
-    }
-
-    /// Teardown + init + set_preset, returning whether the session is armed again.
-    fn reinit_once(&mut self) -> bool {
-        let old = self.handle;
-        self.handle = std::ptr::null_mut();
-        if !old.is_null() {
-            let rc = self.lib.finalize(old);
-            if rc != 0 {
-                warn!("vtCapture_finalizeHistogram returned code {rc} during reinit");
-            }
-        }
-        let handle = self.lib.init();
-        if handle.is_null() {
-            warn!("vtCapture_initHistogram returned NULL during reinit");
-            return false;
-        }
-        self.handle = handle;
-        let rc = self.lib.set_preset(handle, self.preset);
-        if rc != 0 {
-            warn!("vtCapture_setPresetHistogram returned code {rc} during reinit");
-            return false;
-        }
-        true
-    }
-
-    /// Consumes the policy reinit request, retrying inline before giving up.
-    fn handle_reinit(&mut self) -> std::result::Result<(), CaptureError> {
-        for attempt in 1..=REINIT_ATTEMPTS {
-            if self.reinit_once() {
-                info!("histogram session reinitialized (attempt {attempt}/{REINIT_ATTEMPTS})");
-                return Ok(());
-            }
-        }
-        Err(CaptureError::RestartRequired {
-            backend: "histogram",
-            reason: "reinit failed",
         })
     }
 
@@ -332,41 +441,31 @@ impl<L: HistogramLib> HistogramCaptureImpl<L> {
             }
         }
     }
-
-    /// Non-consuming peek at the pending policy reinit request.
-    /// Still unconsumed by production code (Task 5's AutoCapture may use it).
-    #[allow(dead_code)]
-    pub fn reinit_requested(&self) -> bool {
-        REINIT.load(Ordering::SeqCst)
-    }
 }
 
-/// Production constructor over the real dlopen seam.
-impl HistogramCaptureImpl<DlopenHistogramLib> {
-    /// Loads the native histogram API and arms a session at `preset` (0..3).
+/// Production constructor over the direct V4L2 seam.
+impl HistogramCaptureImpl<V4l2HistogramLib> {
+    /// Opens the histogram device and arms a session at `preset` (0..3).
     pub fn try_new(width: u32, height: u32, preset: i32) -> Result<Self> {
-        let lib = DlopenHistogramLib::open().context("histogram capture backend unavailable")?;
-        Self::with_lib(lib, width, height, preset)
+        let lib = V4l2HistogramLib::new();
+        Self::with_lib(lib, width, height, preset).context("histogram capture backend unavailable")
     }
 }
 
 impl<L: HistogramLib> ScreenCapture for HistogramCaptureImpl<L> {
     fn acquire_frame(&mut self) -> std::result::Result<CapturedFrame<'_>, CaptureError> {
-        if REINIT.swap(false, Ordering::SeqCst) {
-            self.handle_reinit()?;
-        }
-
         self.buffer.prefill_indices();
         let rc = self.lib.get(self.handle, self.buffer.as_mut_ptr());
         if rc == 3 {
             return Err(CaptureError::InvalidFrame(anyhow!(
-                "vtCapture_getHistogram returned code 3 (null buffer)"
+                "histogram get returned code 3 (null buffer)"
             )));
         }
         if rc != 0 {
-            // rc 2 is "null handle / not active"; any other code is
-            // undocumented and treated the same way: a transient outage, never
-            // fabricated data.
+            // rc 2 is "null handle / not active"; the rest are the native
+            // codes the seam maps errnos onto (11 not ready, 13 no data,
+            // 17 access conflict, 1 undocumented) — transient outages all,
+            // never fabricated data.
             return Err(CaptureError::Unavailable(NativeCaptureError {
                 backend: "histogram",
                 operation: "get_histogram",
@@ -409,13 +508,13 @@ impl<L: HistogramLib> Drop for HistogramCaptureImpl<L> {
         }
         let rc = self.lib.finalize(handle);
         if rc != 0 {
-            warn!("vtCapture_finalizeHistogram returned code {rc} during drop");
+            warn!("histogram finalize returned code {rc} during drop");
         }
     }
 }
 
 /// Production alias consumed by the runtime wiring.
-pub type HistogramCapture = HistogramCaptureImpl<DlopenHistogramLib>;
+pub type HistogramCapture = HistogramCaptureImpl<V4l2HistogramLib>;
 
 #[cfg(test)]
 mod tests {
@@ -424,7 +523,6 @@ mod tests {
     use std::collections::VecDeque;
     use std::ptr::null_mut;
     use std::rc::Rc;
-    use std::sync::atomic::Ordering;
 
     const TEST_WIDTH: u32 = 320;
     const TEST_HEIGHT: u32 = 180;
@@ -435,7 +533,7 @@ mod tests {
     struct FakeHistogramLib {
         calls: Rc<RefCell<Vec<&'static str>>>,
         /// Token handle returned by `init` when the sequence is exhausted; NULL
-        /// simulates init failure.
+        /// simulates init failure, a `errno_sentinel` value an open failure.
         handle: *mut c_void,
         /// Per-call `init` results, consumed front to back.
         init_handles: VecDeque<*mut c_void>,
@@ -595,66 +693,104 @@ mod tests {
         assert_eq!(*calls.borrow(), ["init", "set_preset", "get"]);
     }
 
-    // 2. REINIT set -> finalize -> init -> set_preset, and still a frame.
+    // 2. Constants finalized from the C5 probe campaign.
     #[test]
-    fn reinit_request_reinitializes_and_still_returns_frame() {
-        let lib = FakeHistogramLib::new().with_fill(|entry| entry.channels[1535] = 3);
-        let calls = lib.calls();
-        let mut capture = capture(lib);
-
-        REINIT.store(true, Ordering::SeqCst);
-        let frame = capture.acquire_frame().expect("frame after reinit");
-        assert_eq!(frame.data.len(), (TEST_WIDTH * TEST_HEIGHT * 4) as usize);
+    fn constants_are_finalized_from_probe_evidence() {
         assert_eq!(
-            *calls.borrow(),
-            [
-                "init",
-                "set_preset",
-                "finalize",
-                "init",
-                "set_preset",
-                "get"
-            ]
+            BIN_LAYOUT,
+            BinLayout::U16x256,
+            "probe settled u8-vs-u16 (analysis/probe-results.md): u16 little-endian"
         );
-        assert!(
-            !capture.reinit_requested(),
-            "acquire_frame must consume the reinit request"
+        assert_eq!(
+            CHANNEL_ORDER,
+            (0, 1, 2),
+            "probe settled the channel order: ch0=R, ch1=G, ch2=B"
         );
     }
 
-    // 3. Three consecutive failed reinits -> RestartRequired.
+    // 3. init EBUSY (another process holds /dev/video60) must surface as the
+    //    distinguishable device_busy error, not a generic init failure.
     #[test]
-    fn three_failed_reinits_report_restart_required() {
-        let token = std::ptr::NonNull::<u8>::dangling().as_ptr().cast();
-        // Construction arms the session; all three inline reinit attempts fail.
-        let lib = FakeHistogramLib::new().with_init_handles(vec![
-            token,
-            null_mut(),
-            null_mut(),
-            null_mut(),
-        ]);
-        let calls = lib.calls();
-        let mut capture = capture(lib);
+    fn init_ebusy_maps_to_device_busy() {
+        let lib = FakeHistogramLib::new().with_init_handles(vec![errno_sentinel(libc::EBUSY)]);
+        let error = with_lib_error(lib, 0);
+        let native = error
+            .downcast_ref::<NativeCaptureError>()
+            .expect("device_busy must carry a NativeCaptureError");
+        assert_eq!(native.backend, "histogram");
+        assert_eq!(native.operation, "device_busy");
+        assert_eq!(native.code, 16, "code is the EBUSY errno");
+        assert!(native.is_busy(), "EBUSY must read as busy to callers");
+    }
 
-        REINIT.store(true, Ordering::SeqCst);
-        let error = frame_error(&mut capture);
-        match error {
-            CaptureError::RestartRequired { backend, reason } => {
-                assert_eq!(backend, "histogram");
-                assert_eq!(reason, "reinit failed");
-            }
-            other => panic!("expected RestartRequired, got {other:?}"),
+    // 4. Other open failures keep the generic init operation but carry the errno.
+    #[test]
+    fn init_open_failure_other_than_ebusy_reports_init_with_errno() {
+        let lib = FakeHistogramLib::new().with_init_handles(vec![errno_sentinel(libc::ENOENT)]);
+        let error = with_lib_error(lib, 0);
+        let native = error
+            .downcast_ref::<NativeCaptureError>()
+            .expect("open failure must carry a NativeCaptureError");
+        assert_eq!(native.operation, "init");
+        assert_eq!(native.code, libc::ENOENT);
+    }
+
+    // 5. Sentinel encoding: round-trips errnos, never aliases real handles.
+    #[test]
+    fn errno_sentinels_round_trip_and_never_alias_real_handles() {
+        for errno in [
+            libc::EACCES,
+            libc::EAGAIN,
+            libc::EBUSY,
+            libc::ENODATA,
+            libc::EIO,
+        ] {
+            assert_eq!(
+                errno_from_sentinel(errno_sentinel(errno)),
+                Some(errno),
+                "sentinel for errno {errno} must round-trip"
+            );
         }
-        // Construction arms the session (init + set_preset). Each reinit
-        // attempt finalizes only when a handle is live: attempt 1 finalizes,
-        // its init returns NULL, and attempts 2-3 skip straight to init.
         assert_eq!(
-            *calls.borrow(),
-            ["init", "set_preset", "finalize", "init", "init", "init"]
+            errno_from_sentinel(null_mut()),
+            None,
+            "NULL is the generic init failure, not a sentinel"
         );
+        let token = std::ptr::NonNull::<u8>::dangling().as_ptr().cast();
+        assert_eq!(
+            errno_from_sentinel(token),
+            None,
+            "the fake's dangling token handle is not a sentinel"
+        );
+        let boxed = Box::into_raw(Box::new(7i32)) as *mut c_void;
+        assert_eq!(
+            errno_from_sentinel(boxed),
+            None,
+            "a real heap handle never sits in the tiny sentinel window"
+        );
+        // SAFETY: reintegrates the allocation boxed above, freeing it once.
+        drop(unsafe { Box::from_raw(boxed as *mut i32) });
     }
 
-    // 4. get returns rc 2 -> Unavailable("get_histogram").
+    // 6. errno → native result-code mapping recorded by the probe campaign.
+    #[test]
+    fn errno_mapping_matches_the_probe_campaign() {
+        assert_eq!(map_errno_to_native_code(libc::EAGAIN), 11, "not ready");
+        assert_eq!(
+            map_errno_to_native_code(libc::EACCES),
+            17,
+            "access conflict"
+        );
+        assert_eq!(map_errno_to_native_code(libc::ENODATA), 13, "no data yet");
+        assert_eq!(
+            map_errno_to_native_code(libc::EIO),
+            1,
+            "undocumented transient"
+        );
+        assert_eq!(map_errno_to_native_code(libc::EINVAL), 1);
+    }
+
+    // 7. get returns rc 2 -> Unavailable("get_histogram").
     #[test]
     fn get_rc_two_reports_unavailable_get_histogram() {
         let lib = FakeHistogramLib::new().with_get_rc(2);
@@ -671,7 +807,7 @@ mod tests {
         }
     }
 
-    // 5. Wholly-absent buffer -> Unavailable("empty_histogram"), never a black frame.
+    // 8. Wholly-absent buffer -> Unavailable("empty_histogram"), never a black frame.
     #[test]
     fn wholly_absent_histogram_is_an_error_not_a_black_canvas() {
         let lib = FakeHistogramLib::new(); // no fill: the driver produced nothing
@@ -688,7 +824,7 @@ mod tests {
         }
     }
 
-    // 6. Mismatched index in the returned buffer -> InvalidFrame.
+    // 9. Mismatched index in the returned buffer -> InvalidFrame.
     #[test]
     fn mismatched_zone_index_is_invalid_frame() {
         let lib = FakeHistogramLib::new().with_fill(|entry| entry.index = 99);
@@ -701,12 +837,14 @@ mod tests {
         );
     }
 
-    // 7. Canvas geometry: zone 5 (row 1, col 1) pure red in exactly its rect.
+    // 10. Canvas geometry: zone 5 (row 1, col 1) pure red in exactly its rect.
     #[test]
     fn canvas_geometry_maps_zone_five_to_its_grid_rect() {
         let lib = FakeHistogramLib::new().with_fill(|entry| {
             if entry.index == 5 {
-                // All counts at the top bin: mean level 511 -> 255, pure red.
+                // All counts in bin 255 (bytes 510..512 of the R block, the
+                // top u16 bin): count 255 at level 255 -> mean 255 -> 255,
+                // pure red under the U16x256 semantics.
                 entry.channels[511] = 0xFF;
             }
         });
@@ -744,7 +882,7 @@ mod tests {
         assert_eq!(red, 80 * 45, "exactly the rect's pixels may be red");
     }
 
-    // 8. zone_to_rgb: count-weighted mean level, scaling, and saturation.
+    // 11. zone_to_rgb: count-weighted mean level, scaling, and saturation.
     #[test]
     fn zone_to_rgb_uses_weighted_mean_level() {
         let mut entry = VtHistogramEntry {
@@ -791,7 +929,7 @@ mod tests {
         );
     }
 
-    // 9. A failed get (rc != 0) must leave no stale colours behind.
+    // 12. A failed get (rc != 0) must leave no stale colours behind.
     #[test]
     fn failed_get_leaves_no_stale_colors_in_the_next_frame() {
         let lib = FakeHistogramLib::new()
@@ -835,25 +973,6 @@ mod tests {
             }
             other => panic!("expected empty_histogram, got {other:?}"),
         }
-    }
-
-    // 10. Construction clears a stale reinit request (session hygiene).
-    #[test]
-    fn construction_clears_a_stale_reinit_request() {
-        REINIT.store(true, Ordering::SeqCst);
-        let lib = FakeHistogramLib::new().with_fill(|entry| entry.channels[0] = 1);
-        let calls = lib.calls();
-        let mut capture = capture(lib);
-        assert!(
-            !capture.reinit_requested(),
-            "a fresh session must not inherit a dropped session's reinit request"
-        );
-        capture.acquire_frame().expect("frame");
-        assert_eq!(
-            *calls.borrow(),
-            ["init", "set_preset", "get"],
-            "no reinit may run on the first acquire"
-        );
     }
 
     // try_new error mapping (rc from set_preset).

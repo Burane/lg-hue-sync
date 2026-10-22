@@ -10,7 +10,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::{error, info, warn};
 
-use super::histogram_types::{ENTRY_SIZE, HistogramBuffer, LIBVTCAPTURE_PATH, VtHistogramEntry};
+use super::histogram_types::{
+    CTRL_HISTOGRAM_DATA, CTRL_HISTOGRAM_ENABLE, CTRL_HISTOGRAM_PRESET, ENTRY_SIZE,
+    HISTOGRAM_V4L2_DEVICE, HistogramBuffer, LIBVTCAPTURE_PATH, V4l2ExtControl, V4l2ExtControls,
+    VIDIOC_G_EXT_CTRLS, VIDIOC_S_EXT_CTRLS, VtHistogramEntry, build_ext_controls,
+};
 
 /// Reinitialization request raised by the policy callback.
 ///
@@ -308,67 +312,9 @@ fn log_zone_summaries(buffer: &HistogramBuffer) {
 // -----------------------------------------------------------------------------
 // Direct V4L2 probe: /dev/video60 without libvtcapture, without the Luna
 // resource manager (both block a plain root process; the kernel node does not).
+// The ABI-correct structs, control IDs, and ioctl numbers live in
+// `histogram_types` (shared with the production backend).
 // -----------------------------------------------------------------------------
-
-/// Kernel node serving the histogram controls directly (webOS 25).
-pub const HISTOGRAM_V4L2_DEVICE: &str = "/dev/video60";
-
-/// V4L2 control IDs reverse-engineered from libvtcapture's VtHistogram
-/// (V4L2_CTRL_CLASS_USER, 0x0098 << 16 | 0x2a1x).
-const CTRL_HISTOGRAM_ENABLE: u32 = 0x0098_2a14;
-const CTRL_HISTOGRAM_PRESET: u32 = 0x0098_2a15;
-const CTRL_HISTOGRAM_DATA: u32 = 0x0098_2a16;
-
-/// `VIDIOC_S_EXT_CTRLS` as issued by the TV's 32-bit ARM userspace
-/// (0x18 = sizeof v4l2_ext_controls on that ABI).
-const VIDIOC_S_EXT_CTRLS: libc::c_ulong = 0xc018_5648;
-/// `VIDIOC_G_EXT_CTRLS`, same ABI.
-const VIDIOC_G_EXT_CTRLS: libc::c_ulong = 0xc018_5647;
-
-/// `struct v4l2_ext_control` exactly as the kernel UAPI lays it out for the
-/// TV's 32-bit ARM ABI: id@0, size@4, reserved2@8, then the 8-byte-wide
-/// packed union at @12 (`value64`/pointers make it 8 bytes; this code only
-/// uses the union's 4-byte members — a raw value for the value controls, or
-/// a buffer pointer for the payload control) with `reserved3` as the union's
-/// tail, keeping the 20-byte packed stride. Fields are stored as fixed-width
-/// `u32` so the layout is identical on 64-bit hosts, where the size unit
-/// tests run. Pointer payloads are cast `as usize as u32`, lossless on the
-/// ARM32 target that is the only caller reaching the ioctl.
-#[repr(C)]
-struct V4l2ExtControl {
-    id: u32,
-    size: u32,
-    reserved2: u32,
-    value_or_ptr: u32,
-    reserved3: u32,
-}
-
-/// `struct v4l2_ext_controls` (24 bytes, 32-bit ARM ABI; `controls` sits at
-/// byte 20 and uses the same fixed-width pointer storage as
-/// [`V4l2ExtControl`]).
-#[repr(C)]
-struct V4l2ExtControls {
-    which: u32,
-    count: u32,
-    error_idx: u32,
-    request_fd: i32,
-    reserved: u32,
-    controls: u32,
-}
-
-/// Builds the single-control `VIDIOC_*_EXT_CTRLS` wrapper: old-style USER
-/// class `which`, exactly one control, no request API, `controls` pointing at
-/// `ctrl`.
-fn build_ext_controls(ctrl: &mut V4l2ExtControl) -> V4l2ExtControls {
-    V4l2ExtControls {
-        which: 0x0098_0000,
-        count: 1,
-        error_idx: 0,
-        request_fd: -1,
-        reserved: 0,
-        controls: ctrl as *mut V4l2ExtControl as usize as u32,
-    }
-}
 
 /// Runs one `VIDIOC_*_EXT_CTRLS` call; a -1 return becomes an error naming
 /// `step`, the errno, and the driver's `error_idx` when it set one.
@@ -500,7 +446,6 @@ impl Drop for HistogramProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::histogram_types::ZONES_PER_PRESET;
     use std::sync::atomic::Ordering;
 
     #[test]
@@ -548,65 +493,6 @@ mod tests {
         assert!(
             REINIT.swap(false, Ordering::SeqCst),
             "trampoline must set REINIT"
-        );
-    }
-
-    #[test]
-    fn direct_ext_ctrl_struct_sizes_match_32bit_arm_abi() {
-        assert_eq!(std::mem::size_of::<V4l2ExtControl>(), 20);
-        assert_eq!(std::mem::size_of::<V4l2ExtControls>(), 24);
-    }
-
-    #[test]
-    fn direct_ext_ctrl_field_offsets_match_kernel_packed_union() {
-        // The kernel reads the ext_control union at byte 12: a payload pointer
-        // placed at any other offset is read as NULL (EFAULT) or garbage.
-        let mut ctrl = V4l2ExtControl {
-            id: 1,
-            size: 2,
-            reserved2: 3,
-            value_or_ptr: 4,
-            reserved3: 5,
-        };
-        let base = std::ptr::addr_of!(ctrl) as usize;
-        assert_eq!(
-            std::ptr::addr_of!(ctrl.value_or_ptr) as usize - base,
-            12,
-            "value/pointer union member must sit at the kernel's packed offset 12"
-        );
-
-        let ctrls = build_ext_controls(&mut ctrl);
-        let wrapper_base = std::ptr::addr_of!(ctrls) as usize;
-        assert_eq!(
-            std::ptr::addr_of!(ctrls.controls) as usize - wrapper_base,
-            20,
-            "controls pointer must sit at the kernel's offset 20"
-        );
-    }
-
-    #[test]
-    fn build_ext_controls_wraps_single_user_class_control() {
-        let mut ctrl = V4l2ExtControl {
-            id: CTRL_HISTOGRAM_DATA,
-            size: (ZONES_PER_PRESET[0] * ENTRY_SIZE) as u32,
-            reserved2: 0,
-            value_or_ptr: 0,
-            reserved3: 0,
-        };
-        // The payload control requests all 16 preset-0 zones in one ioctl.
-        assert_eq!(ctrl.size, 0x6040);
-        let ctrls = build_ext_controls(&mut ctrl);
-        assert_eq!(ctrls.which, 0x0098_0000);
-        assert_eq!(ctrls.count, 1);
-        assert_eq!(ctrls.error_idx, 0);
-        assert_eq!(ctrls.request_fd, -1);
-        assert_eq!(ctrls.reserved, 0);
-        // On the 32-bit ARM TV this is full pointer identity; on a 64-bit host
-        // the fixed-width `controls` field carries the low 32 bits.
-        assert_eq!(
-            ctrls.controls as usize,
-            std::ptr::addr_of_mut!(ctrl) as usize & u32::MAX as usize,
-            "wrapper must carry the control's 32-bit ARM address"
         );
     }
 

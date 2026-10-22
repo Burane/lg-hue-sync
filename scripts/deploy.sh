@@ -103,6 +103,10 @@ cat << 'EOF' > /var/home/root/lg-hue-sync/lg-hue-sync.service
 Description=LG C1 Native Philips Hue & Nanoleaf Sync Daemon
 After=network.target
 Conflicts=sleep.target suspend.target
+# The official Hue Sync service holds /dev/video60 exclusively (single-open
+# V4L2); our direct-ioctl histogram backend needs the node free. No-op on TVs
+# without that unit (e.g. webOS 6.x C1).
+Conflicts=com.lighting.huesync.service
 
 [Service]
 Type=simple

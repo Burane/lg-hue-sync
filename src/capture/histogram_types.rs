@@ -1,7 +1,8 @@
 use anyhow::{Result, anyhow};
 
 // -----------------------------------------------------------------------------
-// webOS 25 Histogram Probe ABI (reverse-engineered from libvtcapture.so.1)
+// webOS 25 Histogram ABI (reverse-engineered from libvtcapture.so.1) and the
+// direct V4L2 control definitions shared by the probe and the backend
 // -----------------------------------------------------------------------------
 
 /// Shared library exposing the histogram capture API on webOS 25 (2025+ models).
@@ -26,6 +27,76 @@ pub struct VtHistogramEntry {
     pub index: i32,
     /// Per-zone channel payload (1536 bytes).
     pub channels: [u8; 1536],
+}
+
+// -----------------------------------------------------------------------------
+// Direct V4L2 histogram controls (kernel node, webOS 25)
+//
+// Reverse-engineered from libvtcapture's VtHistogram and confirmed live on
+// device by the C5 probe campaign (analysis/probe-results.md): the kernel
+// serves these controls to a plain root process, including during DRM
+// playback. Single shared definition; the probe and the production backend
+// both import from here.
+// -----------------------------------------------------------------------------
+
+/// Kernel node serving the histogram controls directly (webOS 25).
+pub(crate) const HISTOGRAM_V4L2_DEVICE: &str = "/dev/video60";
+
+/// V4L2 control IDs reverse-engineered from libvtcapture's VtHistogram
+/// (V4L2_CTRL_CLASS_USER, 0x0098 << 16 | 0x2a1x).
+pub(crate) const CTRL_HISTOGRAM_ENABLE: u32 = 0x0098_2a14;
+pub(crate) const CTRL_HISTOGRAM_PRESET: u32 = 0x0098_2a15;
+pub(crate) const CTRL_HISTOGRAM_DATA: u32 = 0x0098_2a16;
+
+/// `VIDIOC_S_EXT_CTRLS` as issued by the TV's 32-bit ARM userspace
+/// (0x18 = sizeof v4l2_ext_controls on that ABI).
+pub(crate) const VIDIOC_S_EXT_CTRLS: libc::c_ulong = 0xc018_5648;
+/// `VIDIOC_G_EXT_CTRLS`, same ABI.
+pub(crate) const VIDIOC_G_EXT_CTRLS: libc::c_ulong = 0xc018_5647;
+
+/// `struct v4l2_ext_control` exactly as the kernel UAPI lays it out for the
+/// TV's 32-bit ARM ABI: id@0, size@4, reserved2@8, then the 8-byte-wide
+/// packed union at @12 (`value64`/pointers make it 8 bytes; this code only
+/// uses the union's 4-byte members — a raw value for the value controls, or
+/// a buffer pointer for the payload control) with `reserved3` as the union's
+/// tail, keeping the 20-byte packed stride. Fields are stored as fixed-width
+/// `u32` so the layout is identical on 64-bit hosts, where the size unit
+/// tests run. Pointer payloads are cast `as usize as u32`, lossless on the
+/// ARM32 target that is the only caller reaching the ioctl.
+#[repr(C)]
+pub(crate) struct V4l2ExtControl {
+    pub(crate) id: u32,
+    pub(crate) size: u32,
+    pub(crate) reserved2: u32,
+    pub(crate) value_or_ptr: u32,
+    pub(crate) reserved3: u32,
+}
+
+/// `struct v4l2_ext_controls` (24 bytes, 32-bit ARM ABI; `controls` sits at
+/// byte 20 and uses the same fixed-width pointer storage as
+/// [`V4l2ExtControl`]).
+#[repr(C)]
+pub(crate) struct V4l2ExtControls {
+    pub(crate) which: u32,
+    pub(crate) count: u32,
+    pub(crate) error_idx: u32,
+    pub(crate) request_fd: i32,
+    pub(crate) reserved: u32,
+    pub(crate) controls: u32,
+}
+
+/// Builds the single-control `VIDIOC_*_EXT_CTRLS` wrapper: old-style USER
+/// class `which`, exactly one control, no request API, `controls` pointing at
+/// `ctrl`.
+pub(crate) fn build_ext_controls(ctrl: &mut V4l2ExtControl) -> V4l2ExtControls {
+    V4l2ExtControls {
+        which: 0x0098_0000,
+        count: 1,
+        error_idx: 0,
+        request_fd: -1,
+        reserved: 0,
+        controls: ctrl as *mut V4l2ExtControl as usize as u32,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -134,9 +205,73 @@ mod tests {
     #[test]
     fn zone_presets_match_reverse_engineered_layout() {
         assert_eq!(LIBVTCAPTURE_PATH, "/usr/lib/libvtcapture.so.1");
+        assert_eq!(HISTOGRAM_V4L2_DEVICE, "/dev/video60");
         assert_eq!(ZONES_PER_PRESET[0], 16);
         assert_eq!(ZONES_PER_PRESET[3], 14);
         assert_eq!(ZONE_GRID, (4, 4));
+    }
+
+    // -----------------------------------------------------------------------------
+    // Direct V4L2 control ABI: exact layout is non-negotiable
+    // -----------------------------------------------------------------------------
+
+    #[test]
+    fn ext_ctrl_struct_sizes_match_32bit_arm_abi() {
+        assert_eq!(std::mem::size_of::<V4l2ExtControl>(), 20);
+        assert_eq!(std::mem::size_of::<V4l2ExtControls>(), 24);
+    }
+
+    #[test]
+    fn ext_ctrl_field_offsets_match_kernel_packed_union() {
+        // The kernel reads the ext_control union at byte 12: a payload pointer
+        // placed at any other offset is read as NULL (EFAULT) or garbage.
+        let mut ctrl = V4l2ExtControl {
+            id: 1,
+            size: 2,
+            reserved2: 3,
+            value_or_ptr: 4,
+            reserved3: 5,
+        };
+        let base = std::ptr::addr_of!(ctrl) as usize;
+        assert_eq!(
+            std::ptr::addr_of!(ctrl.value_or_ptr) as usize - base,
+            12,
+            "value/pointer union member must sit at the kernel's packed offset 12"
+        );
+
+        let ctrls = build_ext_controls(&mut ctrl);
+        let wrapper_base = std::ptr::addr_of!(ctrls) as usize;
+        assert_eq!(
+            std::ptr::addr_of!(ctrls.controls) as usize - wrapper_base,
+            20,
+            "controls pointer must sit at the kernel's offset 20"
+        );
+    }
+
+    #[test]
+    fn build_ext_controls_wraps_single_user_class_control() {
+        let mut ctrl = V4l2ExtControl {
+            id: CTRL_HISTOGRAM_DATA,
+            size: (ZONES_PER_PRESET[0] * ENTRY_SIZE) as u32,
+            reserved2: 0,
+            value_or_ptr: 0,
+            reserved3: 0,
+        };
+        // The payload control requests all 16 preset-0 zones in one ioctl.
+        assert_eq!(ctrl.size, 0x6040);
+        let ctrls = build_ext_controls(&mut ctrl);
+        assert_eq!(ctrls.which, 0x0098_0000);
+        assert_eq!(ctrls.count, 1);
+        assert_eq!(ctrls.error_idx, 0);
+        assert_eq!(ctrls.request_fd, -1);
+        assert_eq!(ctrls.reserved, 0);
+        // On the 32-bit ARM TV this is full pointer identity; on a 64-bit host
+        // the fixed-width `controls` field carries the low 32 bits.
+        assert_eq!(
+            ctrls.controls as usize,
+            std::ptr::addr_of_mut!(ctrl) as usize & u32::MAX as usize,
+            "wrapper must carry the control's 32-bit ARM address"
+        );
     }
 
     // -----------------------------------------------------------------------------
