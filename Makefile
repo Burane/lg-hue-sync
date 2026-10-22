@@ -18,8 +18,10 @@ CROSS_IMAGE    ?= lg-hue-sync-cross:rust-$(RUST_VERSION)
 CARGO_CACHE    ?= lg-hue-sync-cargo
 TARGET_CACHE   ?= lg-hue-sync-target
 
-SSH_OPTS       := -p $(SSH_PORT) -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5
-SCP_OPTS       := -P $(SSH_PORT) -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5
+# Share one SSH connection across a target so the password is asked once.
+SSH_MUX        := -o ControlMaster=auto -o ControlPath=/tmp/lg-hue-sync-ssh-%r@%h:%p -o ControlPersist=5m
+SSH_OPTS       := -p $(SSH_PORT) -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 $(SSH_MUX)
+SCP_OPTS       := -P $(SSH_PORT) -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 $(SSH_MUX)
 
 # Colors for terminal output
 BOLD   := \033[1m

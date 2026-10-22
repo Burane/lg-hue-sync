@@ -47,7 +47,8 @@ fi
 echo "[+] Binary ready: $(du -h "$BINARY" | cut -f1)"
 
 # 2. Check TV reachability and root status
-COMMON_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=5"
+# Share one SSH connection across the run so the password is asked once.
+COMMON_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 -o ControlMaster=auto -o ControlPath=/tmp/lg-hue-sync-ssh-%r@%h:%p -o ControlPersist=5m"
 SSH_OPTS="-p $SSH_PORT $COMMON_OPTS"
 SCP_OPTS="-P $SSH_PORT $COMMON_OPTS"
 
