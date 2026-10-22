@@ -1,7 +1,7 @@
 use crate::config::Config;
 use anyhow::Result;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use tracing::warn;
 
@@ -35,10 +35,10 @@ impl<T: Send + 'static> HueReconnect<T> {
                     for newer in receiver.try_iter() {
                         command = newer;
                     }
-                    if let Some(config) = active.take() {
-                        if let Err(error) = stop(&config) {
-                            warn!("Failed to deactivate previous Hue session: {error:#}");
-                        }
+                    if let Some(config) = active.take()
+                        && let Err(error) = stop(&config)
+                    {
+                        warn!("Failed to deactivate previous Hue session: {error:#}");
                     }
                     let (epoch, config) = command;
                     let Some(config) = config else {
@@ -64,10 +64,10 @@ impl<T: Send + 'static> HueReconnect<T> {
                     }
                     completed.store(epoch, Ordering::SeqCst);
                 }
-                if let Some(config) = active {
-                    if let Err(error) = stop(&config) {
-                        warn!("Failed to deactivate Hue session at shutdown: {error:#}");
-                    }
+                if let Some(config) = active
+                    && let Err(error) = stop(&config)
+                {
+                    warn!("Failed to deactivate Hue session at shutdown: {error:#}");
                 }
             })?;
         Ok(Self {
@@ -118,10 +118,10 @@ impl<T: Send + 'static> Drop for HueReconnect<T> {
         // Close the queue before joining; network operations have finite deadlines.
         let (replacement, _) = mpsc::channel();
         drop(std::mem::replace(&mut self.commands, replacement));
-        if let Some(worker) = self.worker.take() {
-            if worker.join().is_err() {
-                warn!("Hue reconnect worker panicked");
-            }
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            warn!("Hue reconnect worker panicked");
         }
     }
 }

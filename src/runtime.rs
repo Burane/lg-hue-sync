@@ -136,9 +136,11 @@ mod tests {
             .unwrap();
         let blocked = sender.send(ControlCommand::Start);
         tokio::pin!(blocked);
-        assert!(tokio::time::timeout(Duration::from_millis(5), &mut blocked)
-            .await
-            .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), &mut blocked)
+                .await
+                .is_err()
+        );
         pending.shutdown(receiver);
         assert!(blocked.await.is_err());
         assert!(pending_result.await.is_err());

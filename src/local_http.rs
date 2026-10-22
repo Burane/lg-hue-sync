@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Error};
+use anyhow::{Error, anyhow};
 use std::time::Duration;
 
 /// LAN controllers must not inherit a host proxy or redirect credentials elsewhere.

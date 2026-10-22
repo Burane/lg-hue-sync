@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value;
 use std::time::{Duration, Instant};
@@ -64,12 +64,12 @@ fn pair_nanoleaf_at(base_url: &str, timeout: Duration) -> Result<(String, u16, V
 
         match resp {
             Ok(r) => {
-                if let Ok(json) = r.into_body().read_json::<Value>() {
-                    if let Some(token) = json.get("auth_token").and_then(|v| v.as_str()) {
-                        auth_token = token.to_string();
-                        println!("\n[+] Successfully paired with Nanoleaf controller!");
-                        break;
-                    }
+                if let Ok(json) = r.into_body().read_json::<Value>()
+                    && let Some(token) = json.get("auth_token").and_then(|v| v.as_str())
+                {
+                    auth_token = token.to_string();
+                    println!("\n[+] Successfully paired with Nanoleaf controller!");
+                    break;
                 }
             }
             Err(ureq::Error::StatusCode(403)) => {
@@ -162,11 +162,11 @@ pub fn enable_external_control(ip: &str, auth_token: &str) -> Result<u16> {
 
     let default_port = 60222u16;
     // Some firmwares return UDP details in the response body or headers
-    if let Ok(val) = resp.into_body().read_json::<Value>() {
-        if let Some(port) = val.get("streamControlPort").and_then(|v| v.as_u64()) {
-            info!("Nanoleaf specified streamControlPort: {}", port);
-            return Ok(port as u16);
-        }
+    if let Ok(val) = resp.into_body().read_json::<Value>()
+        && let Some(port) = val.get("streamControlPort").and_then(|v| v.as_u64())
+    {
+        info!("Nanoleaf specified streamControlPort: {}", port);
+        return Ok(port as u16);
     }
 
     Ok(default_port)

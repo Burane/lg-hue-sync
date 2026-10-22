@@ -4,8 +4,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);

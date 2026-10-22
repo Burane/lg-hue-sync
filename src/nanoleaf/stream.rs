@@ -6,8 +6,8 @@ use tracing::error;
 
 use crate::{
     color::{
-        zones::{FloatColor, REFERENCE_FRAME},
         ActiveRect, ColorProcessor, RgbColor,
+        zones::{FloatColor, REFERENCE_FRAME},
     },
     config::{NanoleafAlignment, NanoleafStartCorner},
 };

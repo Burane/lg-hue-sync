@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use openssl::ssl::{SslConnector, SslMethod, SslStream, SslVerifyMode};
 use std::io::{Read, Write};
 use std::net::{IpAddr, UdpSocket};
@@ -58,9 +58,9 @@ impl HueDtlsClient {
     /// Connect to Hue Bridge DTLS port 2100 with PSK identity and client key
     pub fn connect(bridge_ip: &str, username: &str, clientkey_hex: &str) -> Result<Self> {
         let deadline = Instant::now() + Duration::from_secs(5);
-        let psk_bytes = hex_to_bytes(clientkey_hex).with_context(|| {
-            "Failed to parse clientkey as hex (must be 32 hex chars / 16 bytes)"
-        })?;
+        let psk_bytes = hex_to_bytes(clientkey_hex).with_context(
+            || "Failed to parse clientkey as hex (must be 32 hex chars / 16 bytes)",
+        )?;
 
         info!(
             "Configuring DTLS 1.2 PSK connector for {}:2100...",
@@ -207,7 +207,9 @@ mod tests {
         }
         assert_eq!(
             hex_to_bytes("00112233445566778899aAbBcCdDeEfF").unwrap(),
-            [0, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187, 204, 221, 238, 255]
+            [
+                0, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187, 204, 221, 238, 255
+            ]
         );
         assert!(HueDtlsClient::connect("127.0.0.1", "user", "aéa").is_err());
     }

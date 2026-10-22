@@ -94,7 +94,7 @@ pub trait ScreenCapture {
     }
 }
 
-pub use dile_vt::{detect_source_fps, DileVtCapture, MockCapture};
+pub use dile_vt::{DileVtCapture, MockCapture, detect_source_fps};
 pub use vtcapture::VtCapture;
 
 /// Creates a screen capture instance, prioritizing libvtcapture (webOS 6.x / C1 OLED),
@@ -216,10 +216,12 @@ mod tests {
             code: 11,
         })
         .context("capture initialization");
-        assert!(wrapped
-            .downcast_ref::<NativeCaptureError>()
-            .unwrap()
-            .is_busy());
+        assert!(
+            wrapped
+                .downcast_ref::<NativeCaptureError>()
+                .unwrap()
+                .is_busy()
+        );
         if let CaptureError::Unavailable(native) = unavailable(-5) {
             assert_eq!(native.code, -5);
             assert!(!native.is_busy());

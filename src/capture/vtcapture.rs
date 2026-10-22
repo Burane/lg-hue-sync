@@ -1,6 +1,6 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use libloading::{Library, Symbol};
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::Path;
 use tracing::{error, info, warn};
 
@@ -449,10 +449,10 @@ fn prepare_nv12_plane(
             .chunks(stride as usize)
             .take(rows)
             .any(|row| row[..row_width].iter().any(|value| *value < minimum));
-    if let Some(full_len) = full_len.filter(|len| *len <= plane.len()) {
-        if !needs_normalizing {
-            return (std::borrow::Cow::Borrowed(&plane[..full_len]), stride);
-        }
+    if let Some(full_len) = full_len.filter(|len| *len <= plane.len())
+        && !needs_normalizing
+    {
+        return (std::borrow::Cow::Borrowed(&plane[..full_len]), stride);
     }
     // Dimensions and minimal row lengths were checked by nv12_lengths before this helper.
     let mut packed = Vec::with_capacity(row_width * rows);
@@ -524,7 +524,9 @@ impl ScreenCapture for VtCapture {
             self.stale_count += 1;
             // Unchanged address for > 1.5s (90 frames at 60 FPS) indicates frozen video pipe / timing change
             if self.stale_count >= 90 {
-                warn!("Hardware capture buffer address unchanged for 1.5s: resetting pipeline to prevent display mute...");
+                warn!(
+                    "Hardware capture buffer address unchanged for 1.5s: resetting pipeline to prevent display mute..."
+                );
                 self.stop_stream();
                 return Err(CaptureError::RestartRequired {
                     backend: "libvtcapture",
@@ -807,9 +809,11 @@ mod tests {
         for size in [40, 64] {
             let mut rgba = vec![17; size];
             convert_nv12_to_rgba(3, 3, 4, &[235; 11], &[128; 8], &mut rgba).unwrap();
-            assert!(rgba[..36]
-                .chunks_exact(4)
-                .all(|p| p == [255, 255, 255, 255]));
+            assert!(
+                rgba[..36]
+                    .chunks_exact(4)
+                    .all(|p| p == [255, 255, 255, 255])
+            );
             assert!(rgba[36..].iter().all(|v| *v == 17));
         }
         let mut rgba = [17; 4];

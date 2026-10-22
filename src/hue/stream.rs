@@ -71,10 +71,8 @@ impl HueStreamPacketBuilder {
         buffer.write_u8(0x00).unwrap();
 
         // If CLIP v2 UUID is present, append 36-byte lowercase UUID string
-        if has_config_id {
-            if let Some(ref config_id) = self.configuration_id {
-                buffer.extend_from_slice(config_id.as_bytes());
-            }
+        if has_config_id && let Some(ref config_id) = self.configuration_id {
+            buffer.extend_from_slice(config_id.as_bytes());
         }
 
         // Channel updates

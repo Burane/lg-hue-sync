@@ -4,11 +4,11 @@ use crate::{
     hue, nanoleaf,
 };
 use axum::{
+    Json, Router,
     extract::{Path, State},
     http::StatusCode,
     response::{Html, IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{error, info};
 

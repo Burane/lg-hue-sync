@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 // -----------------------------------------------------------------------------
 // webOS 25 Histogram Probe ABI (reverse-engineered from libvtcapture.so.1)

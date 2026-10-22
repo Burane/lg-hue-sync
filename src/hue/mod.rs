@@ -2,7 +2,7 @@ pub mod dtls;
 pub mod reconnect;
 pub mod stream;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use openssl::hash::MessageDigest;
 use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use serde_json::Value;
@@ -43,13 +43,12 @@ pub fn discover_bridge() -> Result<String> {
         .into_body()
         .read_json()
         .context("Failed to parse discovery JSON")?;
-    if let Some(arr) = json.as_array() {
-        if let Some(first) = arr.first() {
-            if let Some(ip) = first.get("internalipaddress").and_then(|v| v.as_str()) {
-                info!("Found Hue Bridge at {}", ip);
-                return Ok(ip.to_string());
-            }
-        }
+    if let Some(arr) = json.as_array()
+        && let Some(first) = arr.first()
+        && let Some(ip) = first.get("internalipaddress").and_then(|v| v.as_str())
+    {
+        info!("Found Hue Bridge at {}", ip);
+        return Ok(ip.to_string());
     }
     Err(anyhow!(
         "No Hue Bridge detected on network via discovery API"
@@ -83,30 +82,29 @@ pub fn pair_bridge(
             .header("Content-Type", "application/json")
             .send_json(payload.clone());
 
-        if let Ok(r) = resp {
-            if let Ok(Value::Array(items)) = r.into_body().read_json::<Value>() {
-                if let Some(first) = items.first() {
-                    if let Some(success) = first.get("success") {
-                        username = success
-                            .get("username")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        clientkey = success
-                            .get("clientkey")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        println!("\n[+] Successfully paired with Hue Bridge!");
-                        break;
-                    } else if let Some(err) = first.get("error") {
-                        if err.get("type").and_then(|v| v.as_i64()) == Some(101) {
-                            print!(".");
-                            use std::io::Write;
-                            std::io::stdout().flush().ok();
-                        }
-                    }
-                }
+        if let Ok(r) = resp
+            && let Ok(Value::Array(items)) = r.into_body().read_json::<Value>()
+            && let Some(first) = items.first()
+        {
+            if let Some(success) = first.get("success") {
+                username = success
+                    .get("username")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                clientkey = success
+                    .get("clientkey")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                println!("\n[+] Successfully paired with Hue Bridge!");
+                break;
+            } else if let Some(err) = first.get("error")
+                && err.get("type").and_then(|v| v.as_i64()) == Some(101)
+            {
+                print!(".");
+                use std::io::Write;
+                std::io::stdout().flush().ok();
             }
         }
         std::thread::sleep(Duration::from_secs(1));
@@ -268,12 +266,12 @@ fn v2_request(
     for byte in digest.as_ref() {
         write!(&mut certificate_sha256, "{byte:02x}")?;
     }
-    if let Some(expected) = expected_certificate_sha256 {
-        if !expected.eq_ignore_ascii_case(&certificate_sha256) {
-            return Err(anyhow!(
-                "Hue Bridge certificate fingerprint changed; refusing V2 request"
-            ));
-        }
+    if let Some(expected) = expected_certificate_sha256
+        && !expected.eq_ignore_ascii_case(&certificate_sha256)
+    {
+        return Err(anyhow!(
+            "Hue Bridge certificate fingerprint changed; refusing V2 request"
+        ));
     }
 
     let body = payload.map(serde_json::to_vec).transpose()?;

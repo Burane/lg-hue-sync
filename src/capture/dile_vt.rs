@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
@@ -375,7 +375,12 @@ impl DileVtCapture {
 
             info!(
                 "[+] DILE_VT hardware video plane ready: {}x{}, stride: {}, format: {:?}, ring buffers: {}, planes: {}",
-                prop.width, prop.height, prop.stride, prop.pixel_format, cap.num_vfbs, cap.num_planes
+                prop.width,
+                prop.height,
+                prop.stride,
+                prop.pixel_format,
+                cap.num_vfbs,
+                cap.num_planes
             );
 
             // 7. Open /dev/mem with O_SYNC to map physical DMA video buffers
@@ -638,8 +643,8 @@ pub fn create_capture(width: u32, height: u32) -> Box<dyn ScreenCapture> {
 }
 
 pub fn detect_source_fps() -> Option<f64> {
-    if std::path::Path::new("/usr/bin/luna-send").exists() {
-        if let Ok(output) = std::process::Command::new("/usr/bin/luna-send")
+    if std::path::Path::new("/usr/bin/luna-send").exists()
+        && let Ok(output) = std::process::Command::new("/usr/bin/luna-send")
             .args([
                 "-n",
                 "1",
@@ -647,13 +652,10 @@ pub fn detect_source_fps() -> Option<f64> {
                 "{}",
             ])
             .output()
-        {
-            if output.status.success() {
-                if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-                    return source_fps_from_video_info(&val);
-                }
-            }
-        }
+        && output.status.success()
+        && let Ok(val) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+    {
+        return source_fps_from_video_info(&val);
     }
     None
 }

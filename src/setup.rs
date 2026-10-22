@@ -14,7 +14,7 @@ pub(crate) async fn run_pair(bridge_opt: Option<String>, output: PathBuf) -> Res
                     "Auto-discovery: {}. Please enter Hue Bridge IP manually:",
                     e
                 );
-                use std::io::{stdin, stdout, Write};
+                use std::io::{Write, stdin, stdout};
                 print!("Bridge IP: ");
                 stdout().flush().ok();
                 let mut line = String::new();
@@ -111,7 +111,7 @@ pub(crate) async fn run_pair_nanoleaf(ip_opt: Option<String>, config_path: PathB
     let ip = match ip_opt {
         Some(ip) => ip,
         None => {
-            use std::io::{stdin, stdout, Write};
+            use std::io::{Write, stdin, stdout};
             print!("Enter Nanoleaf 4D IP address: ");
             stdout().flush().ok();
             let mut line = String::new();

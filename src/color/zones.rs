@@ -1,4 +1,4 @@
-use crate::color::gamut::{rgb_to_xy_brightness, HueGamut, HueXYBrightness};
+use crate::color::gamut::{HueGamut, HueXYBrightness, rgb_to_xy_brightness};
 use crate::config::LightZone;
 use palette::{FromColor, Hsv, Mix, Srgb};
 
@@ -39,11 +39,7 @@ impl RgbColor {
     pub fn saturation(self) -> f32 {
         let max = self.r.max(self.g).max(self.b) as f32 / 255.0;
         let min = self.r.min(self.g).min(self.b) as f32 / 255.0;
-        if max <= 0.001 {
-            0.0
-        } else {
-            (max - min) / max
-        }
+        if max <= 0.001 { 0.0 } else { (max - min) / max }
     }
 
     /// Convert to CIE 1931 xy coordinates and brightness, clamped to Hue Gamut C
