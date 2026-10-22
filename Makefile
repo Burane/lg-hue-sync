@@ -31,7 +31,7 @@ RESET  := \033[0m
 
 .PHONY: help setup check toolchain-update require-tv cross-image build build-local test test-pattern deps-check deps-update release-check \
         deploy deploy-bin deploy-config deploy-app provision-luna status logs start stop restart \
-        test-capture ssh root pair clean cross-clean
+        test-capture test-histogram ssh root pair clean cross-clean
 
 ## display available targets and usage
 help:
@@ -51,7 +51,8 @@ help:
 	@printf "  $(GREEN)make deps-update$(RESET)   Update Cargo.lock within Cargo.toml constraints\n"
 	@printf "  $(GREEN)make release-check$(RESET) Validate version metadata before tagging\n"
 	@printf "  $(GREEN)make test-pattern$(RESET)  Run local rainbow test pattern across Hue and Nanoleaf (Mac -> Lights)\n"
-	@printf "  $(GREEN)make test-capture$(RESET)  Run vtcapture HDMI screen capture probe directly on TV over SSH\n\n"
+	@printf "  $(GREEN)make test-capture$(RESET)  Run vtcapture HDMI screen capture probe directly on TV over SSH\n"
+	@printf "  $(GREEN)make test-histogram$(RESET) Run histogram probe (webOS 24/25) directly on TV over SSH\n\n"
 	@printf "$(CYAN)Deployment (TV IP: $(TV_IP)):$(RESET)\n"
 	@printf "  $(GREEN)make deploy$(RESET)        Full deployment: build, upload binary & config, configure systemd/init.d, start\n"
 	@printf "  $(GREEN)make deploy-bin$(RESET)    Quick deploy: scp binary only to TV and restart daemon\n"
@@ -182,6 +183,11 @@ deploy-app: require-tv
 test-capture: require-tv
 	@printf "$(CYAN)[*] Running test-capture on TV (160x90 vtcapture HDMI probe)...$(RESET)\n"
 	ssh -t $(SSH_OPTS) root@$(TV_IP) "$(REMOTE_DIR)/lg-hue-sync test-capture --config $(REMOTE_DIR)/config.json"
+
+## run webOS 24/25 histogram capture probe on TV over SSH
+test-histogram: require-tv
+	@printf "$(CYAN)[*] Running test-histogram on TV (webOS 24/25 histogram probe)...$(RESET)\n"
+	ssh -t $(SSH_OPTS) root@$(TV_IP) "$(REMOTE_DIR)/lg-hue-sync test-capture --histogram"
 
 ## check daemon systemd service status on TV
 status: require-tv
