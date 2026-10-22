@@ -367,6 +367,14 @@ impl ScreenCapture for AutoCapture {
             Active::Mock => false,
         }
     }
+
+    fn active_kind(&self) -> &'static str {
+        match self.active {
+            Active::Frame => "frame",
+            Active::Histogram => "histogram",
+            Active::Mock => "mock",
+        }
+    }
 }
 
 /// True when every color byte of the frame is zero, alpha ignored. Every
@@ -491,6 +499,11 @@ mod tests {
 
         fn resolution(&self) -> (u32, u32) {
             (self.width, self.height)
+        }
+
+        fn active_kind(&self) -> &'static str {
+            // The dashboard kind is not exercised through this fake.
+            "frame"
         }
 
         fn is_real_hardware(&self) -> bool {
@@ -978,6 +991,41 @@ mod tests {
             (HIST_W, HIST_H),
             "stayed on the histogram backend"
         );
+    }
+
+    // 10. `active_kind` reports the backend currently serving frames.
+    #[test]
+    fn active_kind_tracks_the_serving_backend() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let factory = histogram_factory(vec![Step::Colored], true, calls.clone(), dropped.clone());
+        let mut auto = AutoCapture::with_backends(
+            Some(frame_backend(
+                black(BLACK_FRAMES_BEFORE_SWITCH as usize),
+                true,
+            )),
+            factory,
+            mock_backend(),
+            FRAME_W,
+            FRAME_H,
+        );
+        assert_eq!(auto.active_kind(), "frame");
+
+        // The switch on the 30th black frame is visible immediately.
+        for _ in 0..BLACK_FRAMES_BEFORE_SWITCH {
+            auto.acquire_frame().expect("black frame");
+        }
+        assert_eq!(auto.active_kind(), "histogram");
+
+        // Test seam: frame None starts on the synthetic mock.
+        let mock_auto = AutoCapture::with_backends(
+            None,
+            none_factory(calls.clone()),
+            mock_backend(),
+            FRAME_W,
+            FRAME_H,
+        );
+        assert_eq!(mock_auto.active_kind(), "mock");
     }
 
     // Wiring: the Auto arm of create_capture degrades to the synthetic mock

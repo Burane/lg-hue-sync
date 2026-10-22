@@ -1,6 +1,6 @@
 use crate::{
     color::RgbColor,
-    config::{Config, LightZone, NanoleafAlignment, NanoleafConfig},
+    config::{CaptureBackendMode, Config, LightZone, NanoleafAlignment, NanoleafConfig},
     hue, nanoleaf,
 };
 use axum::{
@@ -61,6 +61,10 @@ pub struct LiveSettings {
     pub hdr_tone_mapping: bool,
     pub hue_sync_enabled: bool,
     pub nanoleaf_sync_enabled: bool,
+    /// Capture backend selector mirrored from `Config::capture_backend`:
+    /// `auto`, `frame`, or `histogram`.
+    #[serde(default)]
+    pub capture_backend: CaptureBackendMode,
     #[serde(default = "default_true")]
     pub auto_tv_power: bool,
     #[serde(default)]
@@ -261,6 +265,9 @@ pub struct SharedState {
     /// 0 = unknown, 1 = active, 2 = standby/off.
     pub tv_power_state: AtomicU32,
     pub capture_resolution: RwLock<String>,
+    /// Capture backend kind currently serving frames ("frame", "histogram",
+    /// or "mock"), refreshed from the capture every frame cycle.
+    pub active_capture: RwLock<String>,
     pub current_settings: RwLock<LiveSettings>,
     settings_update_lock: Mutex<()>,
     pub live_hue_colors: RwLock<Vec<(u8, RgbColor)>>,
@@ -290,6 +297,7 @@ impl SharedState {
             capture_hardware: AtomicBool::new(false),
             tv_power_state: AtomicU32::new(0),
             capture_resolution: RwLock::new(capture_res),
+            active_capture: RwLock::new("unknown".to_string()),
             current_settings: RwLock::new(initial_settings),
             settings_update_lock: Mutex::new(()),
             live_hue_colors: RwLock::new(Vec::new()),
@@ -375,6 +383,7 @@ struct StatusResponse {
     nanoleaf_ip: String,
     capture_hardware: bool,
     capture_resolution: String,
+    active_capture: String,
     settings: LiveSettings,
     nanoleaf_colors: Vec<RgbColor>,
     hue_colors: Vec<(u8, RgbColor)>,
@@ -490,6 +499,7 @@ async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
         nanoleaf_ip: shared.nanoleaf_ip.read().unwrap().clone(),
         capture_hardware: shared.capture_hardware.load(Ordering::Relaxed),
         capture_resolution: shared.capture_resolution.read().unwrap().clone(),
+        active_capture: shared.active_capture.read().unwrap().clone(),
         settings: shared.current_settings.read().unwrap().clone(),
         nanoleaf_colors: shared.live_nanoleaf_colors.read().unwrap().clone(),
         hue_colors: shared.live_hue_colors.read().unwrap().clone(),
@@ -815,6 +825,7 @@ mod tests {
             hdr_tone_mapping: false,
             hue_sync_enabled: true,
             nanoleaf_sync_enabled: true,
+            capture_backend: CaptureBackendMode::Auto,
             auto_tv_power: true,
             nanoleaf_alignment: NanoleafAlignment::default(),
             max_color_step: 12,
@@ -917,6 +928,72 @@ mod tests {
         update.gamma = 1.5;
         assert!(shared.apply_settings(update).await.is_err());
         assert_eq!(shared.current_settings.read().unwrap().gamma, 1.0);
+    }
+
+    #[test]
+    fn capture_backend_defaults_and_round_trips_through_the_settings_api() {
+        // A payload from a dashboard predating the field loads as Auto.
+        let mut json = serde_json::to_value(settings()).unwrap();
+        json.as_object_mut().unwrap().remove("capture_backend");
+        let old: LiveSettings = serde_json::from_value(json).unwrap();
+        assert_eq!(old.capture_backend, CaptureBackendMode::Auto);
+
+        // Each accepted value round-trips as its lowercase serde name.
+        for (value, expected) in [
+            ("auto", CaptureBackendMode::Auto),
+            ("frame", CaptureBackendMode::Frame),
+            ("histogram", CaptureBackendMode::Histogram),
+        ] {
+            let mut payload = serde_json::to_value(settings()).unwrap();
+            payload.as_object_mut().unwrap().insert(
+                "capture_backend".to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
+            let input: LiveSettings = serde_json::from_value(payload).unwrap();
+            assert_eq!(input.capture_backend, expected, "{value}");
+            assert_eq!(
+                serde_json::to_value(&input).unwrap()["capture_backend"],
+                value
+            );
+        }
+
+        // Unknown values are rejected by deserialization, like other
+        // invalid settings input.
+        let mut bogus = serde_json::to_value(settings()).unwrap();
+        bogus.as_object_mut().unwrap()["capture_backend"] =
+            serde_json::Value::String("bogus".to_string());
+        assert!(serde_json::from_value::<LiveSettings>(bogus).is_err());
+    }
+
+    #[tokio::test]
+    async fn settings_request_queues_the_capture_backend_and_updates_shared_state() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let shared = Arc::new(SharedState::new(
+            settings(),
+            String::new(),
+            String::new(),
+            String::new(),
+            Vec::new(),
+            sender,
+        ));
+        let state = AppState {
+            shared: Arc::clone(&shared),
+            config_path: PathBuf::new(),
+        };
+        let mut input = settings();
+        input.capture_backend = CaptureBackendMode::Histogram;
+        assert!(super::settings(State(state), Json(input)).await.is_ok());
+        assert_eq!(
+            shared.current_settings.read().unwrap().capture_backend,
+            CaptureBackendMode::Histogram
+        );
+        assert!(
+            matches!(
+                receiver.recv().await,
+                Some(ControlCommand::ApplySettings(value)) if value.capture_backend == CaptureBackendMode::Histogram
+            ),
+            "the sync loop must receive the new backend"
+        );
     }
 
     #[test]

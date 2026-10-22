@@ -306,7 +306,8 @@
         <div class="edge-strip edge-right" id="rightLeds"></div>
         <div class="tv-center-content" id="previewCenter">
           LG OLED C1<br>
-          <span style="font-size: 0.75rem;" id="captureResolution">320x180</span>
+          <span style="font-size: 0.75rem;" id="captureResolution">320x180</span><br>
+          <span style="font-size: 0.75rem;" id="captureBackendStatus">Capture: unknown</span>
         </div>
       </div>
     </div>
@@ -469,6 +470,12 @@
         <input type="checkbox" id="toggleHdr" onchange="updateSettings()">
         <span class="slider"></span>
       </label>
+    </div>
+
+    <div class="control-group" style="margin-top:14px">
+      <div class="control-header"><label for="captureBackend">Capture source</label></div>
+      <select class="text-input" id="captureBackend" onchange="updateSettings()"><option value="auto">Auto (recommended)</option><option value="frame">Always frame</option><option value="histogram">Always histogram (DRM-safe)</option></select>
+      <div class="toggle-desc">Auto uses frame capture and switches to histogram automatically during protected content (DRM).</div>
     </div>
     </div>
     </div>
@@ -647,6 +654,7 @@
       document.getElementById('statNanoleaf').innerText = data.nanoleaf_connected ? 'Connected @ ' + data.nanoleaf_ip + ' (40 Panels)' : (data.nanoleaf_ip ? 'Configured @ ' + data.nanoleaf_ip + ' · Disconnected' : 'Disconnected');
       if (document.activeElement !== document.getElementById('nanoleafIp') && data.nanoleaf_ip) document.getElementById('nanoleafIp').value = data.nanoleaf_ip;
       document.getElementById('captureResolution').innerText = data.capture_resolution;
+      document.getElementById('captureBackendStatus').innerText = 'Capture: ' + (data.active_capture || 'unknown');
       const settings = data.settings;
       if (!document.activeElement.matches('input[type="range"], select')) {
         document.getElementById('sliderBrightness').value = settings.brightness_multiplier;
@@ -671,6 +679,7 @@
         document.getElementById('toggleHueSync').checked = settings.hue_sync_enabled;
         document.getElementById('toggleNanoleafSync').checked = settings.nanoleaf_sync_enabled;
         document.getElementById('toggleAutoTvPower').checked = settings.auto_tv_power;
+        document.getElementById('captureBackend').value = settings.capture_backend || 'auto';
         document.getElementById('nanoleafStartCorner').value = settings.nanoleaf_alignment.start_corner;
         document.getElementById('nanoleafDirection').value = String(settings.nanoleaf_alignment.reverse_direction);
         document.getElementById('nanoleafOffset').value = settings.nanoleaf_alignment.perimeter_offset;
@@ -748,6 +757,7 @@
       const hueSync = document.getElementById('toggleHueSync').checked;
       const nanoleafSync = document.getElementById('toggleNanoleafSync').checked;
       const autoTvPower = document.getElementById('toggleAutoTvPower').checked;
+      const captureBackend = document.getElementById('captureBackend').value;
 
       document.getElementById('valBrightness').innerText = brightness.toFixed(1) + 'x';
       document.getElementById('valHueOutput').innerText = hueOutputBrightness.toFixed(2) + 'x';
@@ -779,6 +789,7 @@
         hue_sync_enabled: hueSync,
         nanoleaf_sync_enabled: nanoleafSync,
         auto_tv_power: autoTvPower,
+        capture_backend: captureBackend,
         nanoleaf_alignment: {
           start_corner: document.getElementById('nanoleafStartCorner').value,
           reverse_direction: document.getElementById('nanoleafDirection').value === 'true',

@@ -508,6 +508,10 @@ impl<L: HistogramLib> ScreenCapture for HistogramCaptureImpl<L> {
         (self.width, self.height)
     }
 
+    fn active_kind(&self) -> &'static str {
+        "histogram"
+    }
+
     fn is_real_hardware(&self) -> bool {
         true
     }

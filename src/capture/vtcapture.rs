@@ -595,6 +595,10 @@ impl ScreenCapture for VtCapture {
         (self.width, self.height)
     }
 
+    fn active_kind(&self) -> &'static str {
+        "frame"
+    }
+
     fn is_real_hardware(&self) -> bool {
         true
     }

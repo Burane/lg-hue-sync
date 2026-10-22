@@ -94,6 +94,9 @@ pub trait ScreenCapture {
     fn acquire_frame(&mut self) -> std::result::Result<CapturedFrame<'_>, CaptureError>;
     #[allow(dead_code)]
     fn resolution(&self) -> (u32, u32);
+    /// Which backend kind currently serves frames, for dashboard
+    /// observability: "frame", "histogram", or "mock".
+    fn active_kind(&self) -> &'static str;
     fn is_real_hardware(&self) -> bool {
         false
     }

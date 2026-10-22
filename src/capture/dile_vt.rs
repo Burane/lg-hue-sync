@@ -75,6 +75,10 @@ impl ScreenCapture for MockCapture {
     fn resolution(&self) -> (u32, u32) {
         (self.width, self.height)
     }
+
+    fn active_kind(&self) -> &'static str {
+        "mock"
+    }
 }
 
 fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
@@ -607,6 +611,10 @@ impl ScreenCapture for DileVtCapture {
 
     fn resolution(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    fn active_kind(&self) -> &'static str {
+        "frame"
     }
 
     fn is_real_hardware(&self) -> bool {

@@ -577,6 +577,7 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
         hdr_tone_mapping: config.hdr_tone_mapping,
         hue_sync_enabled,
         nanoleaf_sync_enabled,
+        capture_backend: config.capture_backend,
         auto_tv_power: config.auto_tv_power,
         nanoleaf_alignment: config
             .nanoleaf
@@ -614,6 +615,7 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
     shared_state
         .capture_hardware
         .store(capture.is_real_hardware(), Ordering::Relaxed);
+    *shared_state.active_capture.write().unwrap() = capture.active_kind().to_string();
 
     let web_shutdown = CancellationToken::new();
     let web_tasks = match start_web_server(
@@ -634,6 +636,7 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
     let mut current_hue_brightness = config.brightness_multiplier * config.hue_output_brightness;
     let mut current_use_xy = config.use_xy_gamut;
     let mut auto_tv_power = config.auto_tv_power;
+    let mut active_capture_backend = config.capture_backend;
 
     let mut last_channels: Vec<(u8, (u16, u16, u16))> = Vec::new();
     let mut last_nanoleaf_colors: Vec<RgbColor> = Vec::new();
@@ -667,6 +670,15 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
 
     'sync_loop: while running.load(Ordering::SeqCst) {
         pending_commands.receive(&mut command_rx);
+        // Dashboard observability: auto switches backends inside
+        // acquire_frame, so the active kind is refreshed every frame cycle.
+        {
+            let active_kind = capture.active_kind();
+            let mut active_capture = shared_state.active_capture.write().unwrap();
+            if active_capture.as_str() != active_kind {
+                *active_capture = active_kind.to_string();
+            }
+        }
         let loop_start = tokio::time::Instant::now();
         let mut emitted_light_update = false;
 
@@ -892,6 +904,17 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                 observed_tv_power = None;
                 last_tv_power_poll = tokio::time::Instant::now() - Duration::from_secs(2);
             }
+            if active_capture_backend != live_st.capture_backend {
+                info!(
+                    "Capture backend setting changed to {:?}; reinitializing capture...",
+                    live_st.capture_backend
+                );
+                active_capture_backend = live_st.capture_backend;
+                config.capture_backend = live_st.capture_backend;
+                // Recreated on this frame cycle through the existing restart
+                // path below (mock release, settle delay, create_capture).
+                pending_commands.restart = true;
+            }
             current_hue_brightness = live_st.brightness_multiplier * live_st.hue_output_brightness;
             current_use_xy = live_st.use_xy_gamut;
             *shared_state.hue_zones.write().unwrap() = config.zones.clone();
@@ -1003,6 +1026,7 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                 save_cfg.hdr_tone_mapping = live_st.hdr_tone_mapping;
                 save_cfg.hue_sync_enabled = hue_sync_enabled;
                 save_cfg.nanoleaf_sync_enabled = nanoleaf_sync_enabled;
+                save_cfg.capture_backend = live_st.capture_backend;
                 save_cfg.auto_tv_power = live_st.auto_tv_power;
                 save_cfg.max_color_step = live_st.max_color_step;
                 Ok(())
