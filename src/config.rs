@@ -153,6 +153,18 @@ fn default_nanoleaf_segments() -> u16 {
     30
 }
 
+/// Which screen-capture backend the daemon initializes:
+/// `auto` (the default), the classic `frame` chain, or the webOS 24/25
+/// `histogram` API.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CaptureBackendMode {
+    #[default]
+    Auto,
+    Frame,
+    Histogram,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Automatically pause/resume outputs with the TV's active/standby state.
@@ -227,6 +239,9 @@ pub struct Config {
     pub capture_width: u32,
     #[serde(default = "default_capture_height")]
     pub capture_height: u32,
+    /// Capture backend selector: `auto`, `frame`, or `histogram`.
+    #[serde(default)]
+    pub capture_backend: CaptureBackendMode,
 }
 
 fn default_capture_width() -> u32 {
@@ -381,6 +396,7 @@ impl Config {
             zones: default_zones(),
             capture_width: default_capture_width(),
             capture_height: default_capture_height(),
+            capture_backend: CaptureBackendMode::default(),
         }
     }
 
@@ -621,6 +637,47 @@ mod tests {
         assert_eq!((saved.capture_width, saved.capture_height), (370, 230));
         fs::remove_file(&path).unwrap();
         fs::remove_file(format!("{}.lock", path.display())).unwrap();
+    }
+
+    #[test]
+    fn capture_backend_defaults_to_auto_when_field_is_absent() {
+        let config: Config = serde_json::from_str(
+            r#"{"bridge_ip":"127.0.0.1","username":"user","clientkey":"key","entertainment_area_id":"area"}"#,
+        )
+        .unwrap();
+        assert_eq!(config.capture_backend, CaptureBackendMode::Auto);
+    }
+
+    #[test]
+    fn capture_backend_accepts_each_lowercase_variant() {
+        let minimal = |backend: &str| {
+            format!(
+                r#"{{"bridge_ip":"127.0.0.1","username":"user","clientkey":"key","entertainment_area_id":"area","capture_backend":"{backend}"}}"#
+            )
+        };
+        let config: Config = serde_json::from_str(&minimal("histogram")).unwrap();
+        assert_eq!(config.capture_backend, CaptureBackendMode::Histogram);
+        let config: Config = serde_json::from_str(&minimal("frame")).unwrap();
+        assert_eq!(config.capture_backend, CaptureBackendMode::Frame);
+        let config: Config = serde_json::from_str(&minimal("auto")).unwrap();
+        assert_eq!(config.capture_backend, CaptureBackendMode::Auto);
+    }
+
+    #[test]
+    fn capture_backend_rejects_unknown_values() {
+        let config: Result<Config, _> = serde_json::from_str(
+            r#"{"bridge_ip":"127.0.0.1","username":"user","clientkey":"key","entertainment_area_id":"area","capture_backend":"bogus"}"#,
+        );
+        assert!(config.is_err());
+    }
+
+    #[test]
+    fn capture_backend_round_trips_through_serialization() {
+        let mut config = Config::new_default("", "", "", "");
+        config.capture_backend = CaptureBackendMode::Histogram;
+        let saved = serde_json::to_string(&config).unwrap();
+        let loaded: Config = serde_json::from_str(&saved).unwrap();
+        assert_eq!(loaded.capture_backend, CaptureBackendMode::Histogram);
     }
 
     #[test]

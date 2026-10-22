@@ -31,11 +31,9 @@ pub enum BinLayout {
 }
 
 /// Bin layout used until the on-device probe settles u8 vs u16 (Task 7 finalizes).
-#[allow(dead_code)]
 pub const BIN_LAYOUT: BinLayout = BinLayout::U8x512;
 
 /// Channel-block index to (R, G, B) mapping (Task 7 finalizes).
-#[allow(dead_code)]
 pub const CHANNEL_ORDER: (usize, usize, usize) = (0, 1, 2);
 
 /// Maximum per-channel sum for a layout: bins x maximum bin value.
@@ -49,7 +47,6 @@ fn max_channel_sum(layout: BinLayout) -> f64 {
 /// Converts one histogram zone into an 8-bit (R, G, B) colour by summing each
 /// channel block under `layout` and normalizing against the maximum possible
 /// count, saturating at 255. `order` maps channel blocks to (R, G, B).
-#[allow(dead_code)]
 pub fn zone_to_rgb(
     entry: &VtHistogramEntry,
     layout: BinLayout,
@@ -95,7 +92,6 @@ pub trait HistogramLib {
 }
 
 /// Real seam: the dlopen'd `/usr/lib/libvtcapture.so.1` histogram API.
-#[allow(dead_code)]
 pub struct DlopenHistogramLib {
     fn_init_histogram: FnVtCaptureInitHistogram,
     fn_set_preset_histogram: FnVtCaptureSetPresetHistogram,
@@ -104,7 +100,6 @@ pub struct DlopenHistogramLib {
     _lib: Library,
 }
 
-#[allow(dead_code)]
 impl DlopenHistogramLib {
     /// Loads the histogram capture API, mirroring `HistogramProbe::try_new`.
     fn open() -> Result<Self> {
@@ -200,7 +195,6 @@ fn preset_error_context(rc: i32) -> &'static str {
 ///
 /// Generic over the library seam; [`HistogramCapture`] is the production
 /// alias bound to [`DlopenHistogramLib`].
-#[allow(dead_code)]
 pub struct HistogramCaptureImpl<L: HistogramLib> {
     lib: L,
     /// Live session handle; NULL whenever the session is not armed.
@@ -212,7 +206,6 @@ pub struct HistogramCaptureImpl<L: HistogramLib> {
     canvas: Vec<u8>,
 }
 
-#[allow(dead_code)]
 impl<L: HistogramLib> HistogramCaptureImpl<L> {
     /// Arms a session over an already-open seam: init + set_preset.
     fn with_lib(mut lib: L, width: u32, height: u32, preset: i32) -> Result<Self> {
@@ -321,13 +314,14 @@ impl<L: HistogramLib> HistogramCaptureImpl<L> {
     }
 
     /// Non-consuming peek at the pending policy reinit request.
+    /// Still unconsumed by production code (Task 5's AutoCapture may use it).
+    #[allow(dead_code)]
     pub fn reinit_requested(&self) -> bool {
         REINIT.load(Ordering::SeqCst)
     }
 }
 
 /// Production constructor over the real dlopen seam.
-#[allow(dead_code)]
 impl HistogramCaptureImpl<DlopenHistogramLib> {
     /// Loads the native histogram API and arms a session at `preset` (0..3).
     pub fn try_new(width: u32, height: u32, preset: i32) -> Result<Self> {
@@ -336,7 +330,6 @@ impl HistogramCaptureImpl<DlopenHistogramLib> {
     }
 }
 
-#[allow(dead_code)]
 impl<L: HistogramLib> ScreenCapture for HistogramCaptureImpl<L> {
     fn acquire_frame(&mut self) -> std::result::Result<CapturedFrame<'_>, CaptureError> {
         if REINIT.swap(false, Ordering::SeqCst) {
@@ -402,7 +395,6 @@ impl<L: HistogramLib> Drop for HistogramCaptureImpl<L> {
 }
 
 /// Production alias consumed by the runtime wiring.
-#[allow(dead_code)]
 pub type HistogramCapture = HistogramCaptureImpl<DlopenHistogramLib>;
 
 #[cfg(test)]

@@ -501,7 +501,11 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
     }
 
     // 3. Initialize capture
-    let mut capture = create_capture(config.capture_width, config.capture_height);
+    let mut capture = create_capture(
+        config.capture_width,
+        config.capture_height,
+        config.capture_backend,
+    );
 
     // Determine target framerate (supports auto-matching source refresh rate 23.976..60.0 Hz)
     let detected_fps = if config.fps == 0 {
@@ -1164,7 +1168,11 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
             capture_faulted = false;
             capture_recovery = CaptureRecovery::default();
             capture_retry.success();
-            capture = create_capture(config.capture_width, config.capture_height);
+            capture = create_capture(
+                config.capture_width,
+                config.capture_height,
+                config.capture_backend,
+            );
             shared_state
                 .capture_hardware
                 .store(capture.is_real_hardware(), Ordering::Relaxed);
@@ -1483,7 +1491,11 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                 }
 
                 // Re-initialize capture driver
-                capture = create_capture(config.capture_width, config.capture_height);
+                capture = create_capture(
+                    config.capture_width,
+                    config.capture_height,
+                    config.capture_backend,
+                );
                 shared_state
                     .capture_hardware
                     .store(capture.is_real_hardware(), Ordering::Relaxed);
@@ -1648,7 +1660,11 @@ async fn run_test_capture(
         }
         return Err(anyhow!("fewer than five fresh NV12 frames were available"));
     }
-    let mut capture = create_capture(config.capture_width, config.capture_height);
+    let mut capture = create_capture(
+        config.capture_width,
+        config.capture_height,
+        config.capture_backend,
+    );
     let mut sampler = ZoneSampler::new(
         config.zones.clone(),
         0.35,

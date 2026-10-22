@@ -7,6 +7,8 @@ pub mod vtcapture;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
+use crate::config::CaptureBackendMode;
+
 pub struct CapturedFrame<'a> {
     pub data: &'a [u8],
     pub width: u32,
@@ -97,14 +99,14 @@ pub trait ScreenCapture {
 }
 
 pub use dile_vt::{DileVtCapture, MockCapture, detect_source_fps};
-// Consumed by the runtime wiring once the histogram backend is selected (Task 4-5).
-#[allow(unused_imports)]
 pub use histogram::HistogramCapture;
 pub use vtcapture::VtCapture;
 
-/// Creates a screen capture instance, prioritizing libvtcapture (webOS 6.x / C1 OLED),
-/// falling back to dile_vt, and finally to MockCapture.
-pub fn create_capture(width: u32, height: u32) -> Box<dyn ScreenCapture> {
+/// The classic frame-based chain, tried in order: libvtcapture
+/// (webOS 6.x / C1 OLED), legacy libdile_vt, and finally synthetic MockCapture.
+/// Behavior and log messages are unchanged from the pre-`capture_backend`
+/// implementation.
+fn create_frame_capture(width: u32, height: u32) -> Box<dyn ScreenCapture> {
     // 1. Try modern webOS libvtcapture (/usr/lib/libvtcapture.so.1)
     match VtCapture::try_new(width, height) {
         Ok(capture) => {
@@ -151,6 +153,33 @@ pub fn create_capture(width: u32, height: u32) -> Box<dyn ScreenCapture> {
 
     // 3. Fallback to synthetic MockCapture (host macOS, tests, CI)
     Box::new(MockCapture::new(width, height))
+}
+
+/// Creates a screen capture instance for the configured backend.
+///
+/// - [`CaptureBackendMode::Frame`]: the classic frame chain (VtCapture →
+///   DileVtCapture → MockCapture).
+/// - [`CaptureBackendMode::Histogram`]: the webOS 24/25 histogram API at
+///   preset 0 (video); on failure (e.g. a TV without the histogram symbols)
+///   logs a warning and degrades to the frame chain so the TV still gets a
+///   working capture.
+/// - [`CaptureBackendMode::Auto`]: currently the frame chain.
+///   Task 5 replaces with AutoCapture (frame→histogram fallback).
+pub fn create_capture(width: u32, height: u32, mode: CaptureBackendMode) -> Box<dyn ScreenCapture> {
+    match mode {
+        // Task 5 replaces with AutoCapture (frame→histogram fallback).
+        CaptureBackendMode::Auto | CaptureBackendMode::Frame => create_frame_capture(width, height),
+        CaptureBackendMode::Histogram => match HistogramCapture::try_new(width, height, 0) {
+            Ok(capture) => Box::new(capture),
+            Err(e) => {
+                warn!(
+                    "Histogram capture backend unavailable ({}). Falling back to the frame capture chain...",
+                    e
+                );
+                create_frame_capture(width, height)
+            }
+        },
+    }
 }
 
 #[cfg(test)]
@@ -235,7 +264,16 @@ mod tests {
 
     #[test]
     fn test_create_capture_fallback_to_mock() {
-        let mut capture = create_capture(160, 90);
+        let mut capture = create_capture(160, 90, CaptureBackendMode::Frame);
+        let frame = capture.acquire_frame().expect("Acquire mock frame failed");
+        assert_eq!(frame.width, 160);
+        assert_eq!(frame.height, 90);
+        assert_eq!(frame.data.len(), 160 * 90 * 4);
+    }
+
+    #[test]
+    fn test_create_capture_histogram_mode_falls_back_to_mock_without_tv_libraries() {
+        let mut capture = create_capture(160, 90, CaptureBackendMode::Histogram);
         let frame = capture.acquire_frame().expect("Acquire mock frame failed");
         assert_eq!(frame.width, 160);
         assert_eq!(frame.height, 90);
