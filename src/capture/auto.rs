@@ -3,9 +3,10 @@
 //
 // Frame capture preferred while healthy; when frames come back black (DRM
 // playback on webOS 24/25), switch to the histogram backend; when the
-// histogram reports sustained unavailability, switch back. Switching never
-// fabricates frames or errors and never counts as a restart: `CaptureRecovery`
-// in main.rs keeps owning retry/restart budgets.
+// histogram reports sustained unavailability, or a periodic probe finds the
+// frame chain healthy again, switch back. Switching never fabricates frames
+// or errors and never counts as a restart: `CaptureRecovery` in main.rs keeps
+// owning retry/restart budgets.
 // -----------------------------------------------------------------------------
 
 use tracing::{debug, info, warn};
@@ -14,12 +15,19 @@ use super::histogram::HistogramCapture;
 use super::{CaptureError, CapturedFrame, MockCapture, ScreenCapture, create_frame_capture};
 
 /// Consecutive black frames tolerated on the frame backend before switching
-/// to the histogram backend (roughly a quarter second at 30 fps).
-pub const BLACK_FRAMES_BEFORE_SWITCH: u32 = 8;
+/// to the histogram backend (roughly a second at 30 fps — long enough to
+/// ride out ordinary scene fades to black without flapping to the histogram).
+pub const BLACK_FRAMES_BEFORE_SWITCH: u32 = 30;
 
 /// Consecutive `Unavailable` errors tolerated on the histogram backend before
 /// returning to the frame backend.
 pub const HISTOGRAM_ERRORS_BEFORE_RETURN: u32 = 4;
+
+/// Frames served by the histogram backend between periodic probes of the
+/// frame backend (roughly 5 s at 30 fps). The probe is what lets auto leave
+/// the histogram fallback when DRM playback ends even while the histogram
+/// keeps succeeding.
+pub const FRAME_RETRY_INTERVAL: u32 = 150;
 
 /// Which backend `acquire_frame` currently serves from.
 enum Active {
@@ -54,6 +62,9 @@ pub struct AutoCapture {
     height: u32,
     black_frames: u32,
     histogram_errors: u32,
+    /// Frames served by the histogram backend since the last frame-retry
+    /// probe (errored histogram calls serve no frame and do not tick it).
+    histogram_frames: u32,
 }
 
 impl AutoCapture {
@@ -130,6 +141,7 @@ impl AutoCapture {
             height,
             black_frames: 0,
             histogram_errors: 0,
+            histogram_frames: 0,
         }
     }
 
@@ -201,6 +213,7 @@ impl ScreenCapture for AutoCapture {
                                 self.active = Active::Histogram;
                                 self.black_frames = 0;
                                 self.histogram_errors = 0;
+                                self.histogram_frames = 0;
                             }
                             None => {
                                 warn!("histogram unavailable, staying on frame");
@@ -233,6 +246,45 @@ impl ScreenCapture for AutoCapture {
                             self.canvas.copy_from_slice(frame.data);
                         }
                         let (width, height, is_bgra) = (frame.width, frame.height, frame.is_bgra);
+                        // Periodic frame retry, probed AFTER the histogram
+                        // frame has been staged: the staging copy is what
+                        // released the histogram borrow, letting this block
+                        // drop the backend and still return a frame for THIS
+                        // call. Every FRAME_RETRY_INTERVAL histogram frames
+                        // the frame backend is probed once; the probe frame
+                        // is discarded either way and the switch takes
+                        // effect on the next call, mirroring the error-path
+                        // switch-back.
+                        self.histogram_frames += 1;
+                        if self.histogram_frames >= FRAME_RETRY_INTERVAL {
+                            self.histogram_frames = 0;
+                            if let Some(frame_chain) = self.frame.as_mut() {
+                                match frame_chain.acquire_frame() {
+                                    Ok(probe) if !is_black_frame(&probe) => {
+                                        info!("frame capture recovered, returning from histogram");
+                                        // Dropping the backend closes the
+                                        // histogram session; the frame this
+                                        // call returns borrows only the
+                                        // staged canvas.
+                                        self.histogram = None;
+                                        self.active = Active::Frame;
+                                        self.black_frames = 0;
+                                        self.histogram_errors = 0;
+                                    }
+                                    // A black probe means DRM playback is
+                                    // still on: stay on the histogram, count
+                                    // nothing.
+                                    Ok(_) => {}
+                                    // A failing probe is discarded: the
+                                    // retry must never manufacture an error
+                                    // or reset the healthy histogram's
+                                    // error budget.
+                                    Err(error) => {
+                                        debug!("frame retry probe failed: {error:#}");
+                                    }
+                                }
+                            }
+                        }
                         Ok(CapturedFrame {
                             data: &self.canvas,
                             width,
@@ -483,14 +535,14 @@ mod tests {
         })
     }
 
-    // 1. Switch on the 8th consecutive black frame, returning it as-is.
+    // 1. Switch on the 30th consecutive black frame, returning it as-is.
     #[test]
-    fn eighth_consecutive_black_frame_switches_to_histogram_and_is_returned_as_is() {
+    fn thirtieth_consecutive_black_frame_switches_to_histogram_and_is_returned_as_is() {
         let calls = Arc::new(AtomicUsize::new(0));
         let dropped = Arc::new(AtomicUsize::new(0));
         let factory = histogram_factory(vec![Step::Colored], true, calls.clone(), dropped.clone());
         let mut auto = AutoCapture::with_backends(
-            Some(frame_backend(black(9), true)),
+            Some(frame_backend(black(31), true)),
             factory,
             mock_backend(),
             FRAME_W,
@@ -498,8 +550,8 @@ mod tests {
         );
         assert!(auto.is_real_hardware(), "frame fake reports real hardware");
 
-        // 7 black frames: still on the frame chain (8th not yet reached).
-        for i in 0..7 {
+        // 29 black frames: still on the frame chain (30th not yet reached).
+        for i in 0..29 {
             let frame = auto.acquire_frame().expect("black frame");
             assert_eq!(
                 frame.width, FRAME_W,
@@ -510,10 +562,10 @@ mod tests {
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,
-            "no switch before the 8th black frame"
+            "no switch before the 30th black frame"
         );
 
-        // 8th black frame: returned as-is AND switches.
+        // 30th black frame: returned as-is AND switches.
         let frame = auto.acquire_frame().expect("switching black frame");
         assert_eq!(
             frame.width, FRAME_W,
@@ -555,7 +607,7 @@ mod tests {
             calls.clone(),
             dropped.clone(),
         );
-        let mut frame_steps = black(8);
+        let mut frame_steps = black(BLACK_FRAMES_BEFORE_SWITCH as usize);
         frame_steps.push(Step::Colored);
         let mut auto = AutoCapture::with_backends(
             Some(frame_backend(frame_steps, true)),
@@ -565,7 +617,7 @@ mod tests {
             FRAME_H,
         );
 
-        for _ in 0..8 {
+        for _ in 0..BLACK_FRAMES_BEFORE_SWITCH {
             auto.acquire_frame().expect("black frame");
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1, "switched to histogram");
@@ -613,7 +665,7 @@ mod tests {
     fn frame_errors_propagate_unchanged_and_never_touch_the_black_counter() {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut frame_steps = vec![Step::Unavailable];
-        frame_steps.extend(black(8));
+        frame_steps.extend(black(BLACK_FRAMES_BEFORE_SWITCH as usize));
         let mut auto = AutoCapture::with_backends(
             Some(frame_backend(frame_steps, true)),
             none_factory(calls.clone()),
@@ -628,19 +680,19 @@ mod tests {
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
-        // 7 further black frames stay under the threshold: the error did not
+        // 29 further black frames stay under the threshold: the error did not
         // advance (or reset) the black counter.
-        for _ in 0..7 {
+        for _ in 0..29 {
             let frame = auto.acquire_frame().expect("black frame");
             assert_eq!(frame.width, FRAME_W);
         }
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,
-            "no factory call before the 8th black frame"
+            "no factory call before the 30th black frame"
         );
 
-        // The 8th black frame attempts the switch; the factory returns None,
+        // The 30th black frame attempts the switch; the factory returns None,
         // the capture stays on frame, and the black frame is returned as-is.
         let frame = auto.acquire_frame().expect("black frame on failed switch");
         assert_eq!(frame.width, FRAME_W);
@@ -657,9 +709,9 @@ mod tests {
     #[test]
     fn a_colored_frame_resets_the_black_streak_before_the_switch_threshold() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut frame_steps = black(7);
+        let mut frame_steps = black(29);
         frame_steps.push(Step::Colored);
-        frame_steps.extend(black(8));
+        frame_steps.extend(black(29));
         let mut auto = AutoCapture::with_backends(
             Some(frame_backend(frame_steps, true)),
             none_factory(calls.clone()),
@@ -668,7 +720,7 @@ mod tests {
             FRAME_H,
         );
 
-        for i in 0..15 {
+        for i in 0..59 {
             let frame = auto.acquire_frame().expect("frame");
             assert_eq!(
                 frame.width, FRAME_W,
@@ -678,11 +730,11 @@ mod tests {
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,
-            "7 black + 1 colored + 7 black stays under the threshold"
+            "29 black + 1 colored + 29 black stays under the threshold"
         );
 
-        // The 8th black frame after the reset attempts the switch.
-        auto.acquire_frame().expect("16th frame");
+        // The 30th black frame after the reset attempts the switch.
+        auto.acquire_frame().expect("60th frame");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
@@ -693,14 +745,17 @@ mod tests {
         let dropped = Arc::new(AtomicUsize::new(0));
         let factory = histogram_factory(vec![Step::Colored], true, calls.clone(), dropped.clone());
         let mut auto = AutoCapture::with_backends(
-            Some(frame_backend(black(8), true)),
+            Some(frame_backend(
+                black(BLACK_FRAMES_BEFORE_SWITCH as usize),
+                true,
+            )),
             factory,
             mock_backend(),
             FRAME_W,
             FRAME_H,
         );
         assert!(auto.is_real_hardware(), "frame fake is real hardware");
-        for _ in 0..8 {
+        for _ in 0..BLACK_FRAMES_BEFORE_SWITCH {
             auto.acquire_frame().expect("black frame");
         }
         assert!(
@@ -752,6 +807,150 @@ mod tests {
         assert!(
             !is_black(&[0, 0, 0, 255, 0], true),
             "non-multiple-of-4 length is not a black frame"
+        );
+    }
+
+    // 7. Periodic frame retry: a healthy probe at the interval boundary
+    //    switches back to frame and drops the histogram box.
+    #[test]
+    fn healthy_frame_probe_at_the_retry_interval_returns_to_frame() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let factory = histogram_factory(vec![Step::Colored], true, calls.clone(), dropped.clone());
+        // Frame chain: the threshold black frames trigger the switch, then
+        // the chain recovers (colored) — the retry probe reads that recovery.
+        let mut frame_steps = black(BLACK_FRAMES_BEFORE_SWITCH as usize);
+        frame_steps.push(Step::Colored);
+        let mut auto = AutoCapture::with_backends(
+            Some(frame_backend(frame_steps, true)),
+            factory,
+            mock_backend(),
+            FRAME_W,
+            FRAME_H,
+        );
+
+        for _ in 0..BLACK_FRAMES_BEFORE_SWITCH {
+            auto.acquire_frame().expect("black frame");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "switched to histogram");
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+
+        // FRAME_RETRY_INTERVAL - 1 histogram frames: no probe yet.
+        for _ in 1..FRAME_RETRY_INTERVAL {
+            let frame = auto.acquire_frame().expect("histogram frame");
+            assert_eq!(frame.width, HIST_W);
+        }
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            0,
+            "no probe before the interval"
+        );
+
+        // The interval call probes the frame chain, finds it healthy, drops
+        // the histogram box — but THIS call still serves the histogram's
+        // staged frame.
+        let frame = auto.acquire_frame().expect("interval histogram frame");
+        assert_eq!(
+            frame.width, HIST_W,
+            "the probing call still serves the histogram frame"
+        );
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            1,
+            "histogram box dropped exactly once"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "histogram never rebuilt");
+        assert_eq!(
+            auto.resolution(),
+            (FRAME_W, FRAME_H),
+            "frame is the active backend again"
+        );
+
+        // The next call hits the recovered frame chain.
+        let frame = auto.acquire_frame().expect("recovered frame");
+        assert_eq!(frame.width, FRAME_W);
+        assert!(!is_black_frame(&frame));
+    }
+
+    // 8. A black retry probe keeps the histogram in charge, interval after
+    //    interval, counting nothing.
+    #[test]
+    fn black_frame_probes_keep_the_histogram_active_across_intervals() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let factory = histogram_factory(vec![Step::Colored], true, calls.clone(), dropped.clone());
+        // Frame chain never recovers: black forever (the last scripted step
+        // repeats, so every probe sees black too).
+        let mut auto = AutoCapture::with_backends(
+            Some(frame_backend(
+                black(BLACK_FRAMES_BEFORE_SWITCH as usize + 1),
+                true,
+            )),
+            factory,
+            mock_backend(),
+            FRAME_W,
+            FRAME_H,
+        );
+
+        for _ in 0..BLACK_FRAMES_BEFORE_SWITCH {
+            auto.acquire_frame().expect("black frame");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "switched to histogram");
+
+        // Three full intervals plus a tail: the probes at 150/300/450 all
+        // see a black frame chain and change nothing.
+        for i in 1..=3 * FRAME_RETRY_INTERVAL + 5 {
+            let frame = auto
+                .acquire_frame()
+                .expect("histogram keeps serving frames");
+            assert_eq!(frame.width, HIST_W, "call {i} stays on the histogram");
+        }
+        assert_eq!(dropped.load(Ordering::SeqCst), 0, "histogram box alive");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "histogram never rebuilt");
+        assert_eq!(
+            auto.resolution(),
+            (HIST_W, HIST_H),
+            "histogram is still the active backend"
+        );
+    }
+
+    // 9. A failing retry probe is swallowed: no error propagation, no switch.
+    #[test]
+    fn failing_frame_probes_are_discarded_and_change_nothing() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let factory = histogram_factory(vec![Step::Colored], true, calls.clone(), dropped.clone());
+        // Frame chain: the threshold black frames trigger the switch, then
+        // every probe errors (the last scripted step repeats).
+        let mut frame_steps = black(BLACK_FRAMES_BEFORE_SWITCH as usize);
+        frame_steps.push(Step::Unavailable);
+        let mut auto = AutoCapture::with_backends(
+            Some(frame_backend(frame_steps, true)),
+            factory,
+            mock_backend(),
+            FRAME_W,
+            FRAME_H,
+        );
+
+        for _ in 0..BLACK_FRAMES_BEFORE_SWITCH {
+            auto.acquire_frame().expect("black frame");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "switched to histogram");
+
+        // Past two interval boundaries: the errored probes at 150 and 300
+        // never surface — every call still succeeds with a histogram frame.
+        for _ in 0..2 * FRAME_RETRY_INTERVAL + 7 {
+            let frame = auto
+                .acquire_frame()
+                .expect("probe errors must never propagate");
+            assert_eq!(frame.width, HIST_W);
+        }
+        assert_eq!(dropped.load(Ordering::SeqCst), 0, "histogram box alive");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "histogram never rebuilt");
+        assert_eq!(
+            auto.resolution(),
+            (HIST_W, HIST_H),
+            "stayed on the histogram backend"
         );
     }
 
