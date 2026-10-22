@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Level, error, info, warn};
 use tracing_subscriber::FmtSubscriber;
 
+use capture::histogram_probe::HistogramProbe;
 use capture::{
     CaptureRecovery, MockCapture, RecoveryAction, ScreenCapture, VtCapture, create_capture,
     detect_source_fps,
@@ -68,6 +69,9 @@ enum Commands {
         /// Report central raw NV12 statistics without saving frame pixels or sending light output
         #[arg(long)]
         raw_nv12_stats: bool,
+        /// Probe the webOS 24/25 histogram capture API (diagnostic; no light output, no frame files)
+        #[arg(long)]
+        histogram: bool,
     },
     /// Discover and pair with a Philips Hue Bridge via pushlink button
     Pair {
@@ -108,7 +112,8 @@ async fn main() -> Result<()> {
         Commands::TestCapture {
             config,
             raw_nv12_stats,
-        } => run_test_capture(config, raw_nv12_stats).await,
+            histogram,
+        } => run_test_capture(config, raw_nv12_stats, histogram).await,
         Commands::Pair { bridge, output } => run_pair(bridge, output).await,
         Commands::SyncHue { config, area } => run_sync_hue(config, area).await,
         Commands::PairNanoleaf { ip, config } => run_pair_nanoleaf(ip, config).await,
@@ -1597,8 +1602,21 @@ async fn run_test_nanoleaf(config_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn run_test_capture(config_path: PathBuf, raw_nv12_stats: bool) -> Result<()> {
+async fn run_test_capture(
+    config_path: PathBuf,
+    raw_nv12_stats: bool,
+    histogram: bool,
+) -> Result<()> {
     let config = Config::load(&config_path)?;
+    if histogram {
+        if raw_nv12_stats {
+            warn!("--raw-nv12-stats is ignored: --histogram runs the histogram capture probe");
+        }
+        let mut probe = HistogramProbe::try_new()
+            .context("histogram probe requires the webOS 24/25 histogram capture API")?;
+        probe.run(20, Duration::from_millis(100), 0, 16);
+        return Ok(());
+    }
     if raw_nv12_stats {
         info!(
             "TV reports {} mode; this does not establish the capture colour space",
