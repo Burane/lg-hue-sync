@@ -1202,20 +1202,23 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
             }
         }
 
-        // If currently on fallback MockCapture, rapidly probe if hardware VtCapture has become available
-        // (e.g. if the TV was on the home screen at boot or during input/format switch)
+        // If currently on fallback MockCapture, rapidly probe if hardware capture has become available
+        // (e.g. if the TV was on the home screen at boot or during input/format switch).
+        // Rebuilt through the configured backend so auto keeps its DRM histogram fallback.
         if !capture.is_real_hardware() && capture_retry.ready() {
-            match VtCapture::try_new(config.capture_width, config.capture_height) {
-                Ok(hw_capture) => {
-                    info!("[+] Successfully upgraded from MockCapture to hardware VtCapture!");
-                    capture = Box::new(hw_capture);
-                    capture_retry.success();
-                    shared_state.capture_hardware.store(true, Ordering::Relaxed);
-                }
-                Err(error) => {
-                    let delay = capture_retry.failure();
-                    warn!("Hardware capture unavailable ({error:#}); retrying in {delay:?}");
-                }
+            let candidate = create_capture(
+                config.capture_width,
+                config.capture_height,
+                config.capture_backend,
+            );
+            if candidate.is_real_hardware() {
+                info!("[+] Successfully upgraded from MockCapture to hardware capture!");
+                capture = candidate;
+                capture_retry.success();
+                shared_state.capture_hardware.store(true, Ordering::Relaxed);
+            } else {
+                let delay = capture_retry.failure();
+                warn!("Hardware capture unavailable; retrying in {delay:?}");
             }
         }
 

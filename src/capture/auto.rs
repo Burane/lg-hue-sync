@@ -19,6 +19,13 @@ use super::{CaptureError, CapturedFrame, MockCapture, ScreenCapture, create_fram
 /// ride out ordinary scene fades to black without flapping to the histogram).
 pub const BLACK_FRAMES_BEFORE_SWITCH: u32 = 30;
 
+/// Cap on the doubling backoff after failed histogram switch attempts:
+/// the black streak needed doubles per failure up to
+/// `BLACK_FRAMES_BEFORE_SWITCH << 6` (about a minute at 30 fps), so a TV
+/// without the histogram node (C1) or with it held elsewhere is not
+/// re-probed every second of a dark scene.
+const MAX_SWITCH_BACKOFF_SHIFT: u32 = 6;
+
 /// Consecutive `Unavailable` errors tolerated on the histogram backend before
 /// returning to the frame backend.
 pub const HISTOGRAM_ERRORS_BEFORE_RETURN: u32 = 4;
@@ -61,6 +68,8 @@ pub struct AutoCapture {
     width: u32,
     height: u32,
     black_frames: u32,
+    /// Consecutive failed histogram switch attempts; drives the backoff.
+    histogram_failures: u32,
     histogram_errors: u32,
     /// Frames served by the histogram backend since the last frame-retry
     /// probe (errored histogram calls serve no frame and do not tick it).
@@ -140,6 +149,7 @@ impl AutoCapture {
             width,
             height,
             black_frames: 0,
+            histogram_failures: 0,
             histogram_errors: 0,
             histogram_frames: 0,
         }
@@ -201,7 +211,9 @@ impl ScreenCapture for AutoCapture {
                 let frame = acquired?;
                 if is_black_frame(&frame) {
                     self.black_frames += 1;
-                    if self.black_frames >= BLACK_FRAMES_BEFORE_SWITCH {
+                    let threshold = BLACK_FRAMES_BEFORE_SWITCH
+                        << self.histogram_failures.min(MAX_SWITCH_BACKOFF_SHIFT);
+                    if self.black_frames >= threshold {
                         let factory = self
                             .histogram_factory
                             .as_mut()
@@ -212,11 +224,17 @@ impl ScreenCapture for AutoCapture {
                                 self.histogram = Some(histogram);
                                 self.active = Active::Histogram;
                                 self.black_frames = 0;
+                                self.histogram_failures = 0;
                                 self.histogram_errors = 0;
                                 self.histogram_frames = 0;
                             }
                             None => {
-                                warn!("histogram unavailable, staying on frame");
+                                if self.histogram_failures == 0 {
+                                    warn!("histogram unavailable, staying on frame");
+                                } else {
+                                    debug!("histogram still unavailable, staying on frame");
+                                }
+                                self.histogram_failures += 1;
                                 self.black_frames = 0;
                             }
                         }
@@ -703,6 +721,14 @@ mod tests {
             (FRAME_W, FRAME_H),
             "stayed on the frame backend"
         );
+
+        // Backoff: the next attempt needs twice the black streak.
+        for _ in 0..(2 * BLACK_FRAMES_BEFORE_SWITCH - 1) {
+            auto.acquire_frame().expect("black frame");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry before 2x streak");
+        auto.acquire_frame().expect("black frame");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "retry at 2x streak");
     }
 
     // 4. Hysteresis reset: a colored frame clears the black streak.

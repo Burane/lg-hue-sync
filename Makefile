@@ -186,8 +186,8 @@ test-capture: require-tv
 
 ## run webOS 24/25 histogram capture probe on TV over SSH
 test-histogram: require-tv
-	@printf "$(CYAN)[*] Running test-histogram on TV (webOS 24/25 histogram probe)...$(RESET)\n"
-	ssh -t $(SSH_OPTS) root@$(TV_IP) "$(REMOTE_DIR)/lg-hue-sync test-capture --histogram"
+	@printf "$(CYAN)[*] Running test-histogram on TV (webOS 24/25 direct V4L2 histogram probe)...$(RESET)\n"
+	ssh -t $(SSH_OPTS) root@$(TV_IP) "$(REMOTE_DIR)/lg-hue-sync test-capture --histogram-direct"
 
 ## check daemon systemd service status on TV
 status: require-tv

@@ -15,9 +15,12 @@ pub const ZONES_PER_PRESET: [usize; 4] = [16, 16, 16, 14];
 /// validated on-device before it is used for light placement.
 pub const ZONE_GRID: (u32, u32) = (4, 4);
 
+/// Per-zone channel payload: three 512-byte channel blocks.
+pub const CHANNEL_BYTES: usize = 3 * 512;
+
 /// Native per-entry stride observed in the histogram dump:
-/// 4-byte zone index followed by 1536 bytes of channel data.
-pub const ENTRY_SIZE: usize = 0x604;
+/// 4-byte zone index followed by [`CHANNEL_BYTES`] of channel data.
+pub const ENTRY_SIZE: usize = std::mem::size_of::<VtHistogramEntry>();
 
 /// One histogram zone as laid out by the native dump.
 #[repr(C)]
@@ -25,8 +28,8 @@ pub const ENTRY_SIZE: usize = 0x604;
 pub struct VtHistogramEntry {
     /// Zone index reported by the driver; must equal the entry's position in the buffer.
     pub index: i32,
-    /// Per-zone channel payload (1536 bytes).
-    pub channels: [u8; 1536],
+    /// Per-zone channel payload.
+    pub channels: [u8; CHANNEL_BYTES],
 }
 
 // -----------------------------------------------------------------------------
@@ -116,7 +119,7 @@ impl HistogramBuffer {
             entries: vec![
                 VtHistogramEntry {
                     index: 0,
-                    channels: [0; 1536],
+                    channels: [0; CHANNEL_BYTES],
                 };
                 zones
             ],
@@ -131,7 +134,7 @@ impl HistogramBuffer {
     pub fn prefill_indices(&mut self) {
         for (position, entry) in self.entries.iter_mut().enumerate() {
             entry.index = position as i32;
-            entry.channels = [0; 1536];
+            entry.channels = [0; CHANNEL_BYTES];
         }
     }
 
@@ -162,7 +165,8 @@ impl HistogramBuffer {
     }
 
     /// Checks that every entry's `index` still equals its position, catching a
-    /// driver that writes fewer zones than requested or shuffles them.
+    /// driver that shuffles zones or writes foreign indices. It cannot catch a
+    /// short write: untouched entries keep their prefilled index.
     pub fn validate_indices(&self) -> Result<()> {
         for (position, entry) in self.entries.iter().enumerate() {
             if entry.index != position as i32 {
@@ -192,23 +196,7 @@ mod tests {
 
     #[test]
     fn channels_field_starts_at_byte_offset_4() {
-        let entry = VtHistogramEntry {
-            index: 7,
-            channels: [0; 1536],
-        };
-        let base = std::ptr::addr_of!(entry.index) as usize;
-        let channels = std::ptr::addr_of!(entry.channels) as usize;
-        assert_eq!(channels - base, 4);
-        assert_eq!(channels - base, std::mem::size_of::<i32>());
-    }
-
-    #[test]
-    fn zone_presets_match_reverse_engineered_layout() {
-        assert_eq!(LIBVTCAPTURE_PATH, "/usr/lib/libvtcapture.so.1");
-        assert_eq!(HISTOGRAM_V4L2_DEVICE, "/dev/video60");
-        assert_eq!(ZONES_PER_PRESET[0], 16);
-        assert_eq!(ZONES_PER_PRESET[3], 14);
-        assert_eq!(ZONE_GRID, (4, 4));
+        assert_eq!(std::mem::offset_of!(VtHistogramEntry, channels), 4);
     }
 
     // -----------------------------------------------------------------------------

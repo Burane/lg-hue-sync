@@ -198,7 +198,10 @@ fn open_histogram_device() -> Result<libc::c_int, i32> {
     // SAFETY: `path` outlives the call and open() only reads it.
     let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
     if fd < 0 {
-        return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+        // Never 0: errno_sentinel(0) would encode as a live-looking handle.
+        return Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO));
     }
     Ok(fd)
 }
@@ -393,6 +396,9 @@ impl<L: HistogramLib> HistogramCaptureImpl<L> {
         }
         let rc = lib.set_preset(handle, preset);
         if rc != 0 {
+            // Self is never built, so Drop won't close the session: release
+            // it here or the single-open device stays busy until restart.
+            lib.finalize(handle);
             return Err(anyhow::Error::new(NativeCaptureError {
                 backend: "histogram",
                 operation: "set_preset",
@@ -472,7 +478,16 @@ impl<L: HistogramLib> ScreenCapture for HistogramCaptureImpl<L> {
                 code: rc,
             }));
         }
-        self.buffer.validate_indices()?;
+        // A shuffled or foreign write is a transient driver fault, not a corrupt
+        // frame: Unavailable lets CaptureRecovery retry instead of pausing.
+        if let Err(error) = self.buffer.validate_indices() {
+            warn!("histogram zone validation failed: {error:#}");
+            return Err(CaptureError::Unavailable(NativeCaptureError {
+                backend: "histogram",
+                operation: "zone_index_mismatch",
+                code: 13,
+            }));
+        }
         if self.buffer.is_wholly_absent() {
             return Err(CaptureError::Unavailable(NativeCaptureError {
                 backend: "histogram",
@@ -824,17 +839,18 @@ mod tests {
         }
     }
 
-    // 9. Mismatched index in the returned buffer -> InvalidFrame.
+    // 9. Mismatched index in the returned buffer -> transient Unavailable.
     #[test]
-    fn mismatched_zone_index_is_invalid_frame() {
+    fn mismatched_zone_index_is_unavailable() {
         let lib = FakeHistogramLib::new().with_fill(|entry| entry.index = 99);
         let mut capture = capture(lib);
 
-        let error = frame_error(&mut capture);
-        assert!(
-            matches!(error, CaptureError::InvalidFrame(_)),
-            "expected InvalidFrame, got {error:?}"
-        );
+        match frame_error(&mut capture) {
+            CaptureError::Unavailable(native) => {
+                assert_eq!(native.operation, "zone_index_mismatch")
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
     }
 
     // 10. Canvas geometry: zone 5 (row 1, col 1) pure red in exactly its rect.
@@ -979,7 +995,12 @@ mod tests {
     #[test]
     fn set_preset_failure_maps_to_native_error_context() {
         let lib = FakeHistogramLib::new().with_preset_rc(2);
+        let calls = lib.calls();
         let error = with_lib_error(lib, 0);
+        assert!(
+            calls.borrow().contains(&"finalize"),
+            "failed set_preset must release the session"
+        );
         let message = format!("{error:#}");
         assert!(
             message.contains("histogram mode not activated"),
