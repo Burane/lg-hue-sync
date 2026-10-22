@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-22
+
+### Added
+- Track Hue ownership and partial configuration changes through a bounded SSE subscription; refresh the selected layout before first output and after topology changes.
+- Discover bridges through local mDNS with a rate-limited cloud fallback; recover changed addresses only for the saved Bridge ID.
+- Repeat cached Hue packets at 50 Hz independently of capture cadence. Adaptive deadband still suppresses new colour-update submissions; no additional sampling is performed for repeats.
+
+### Changed
+- Pair exclusively over verified HTTPS using both official Hue root CAs and the Bridge ID. Migrate existing leaf pins only after an exact match, then accept signed certificate renewal for that identity.
+- Use the separate application ID from `/auth/v1` for DTLS authentication and stream ownership. Preserve pairing credentials when area selection is still required.
+- Delegate the deprecated Python pairing helper to the host Rust CLI; remove plaintext pairing and direct Hyperion mutation.
+- Update architecture, operations, agent and skill guidance with recovery rules and current Hue documentation findings.
+
+### Fixed
+- Refuse automatic takeover and avoid deliberately stopping another application's Hue stream. Suspend Hue independently of Nanoleaf on ownership loss.
+- Stop cached Hue output on revoked authorization, deleted areas or failed topology refresh; keep stale mappings blocked across manual Start, Restart and output re-enable.
+- Use configured Hue channel IDs in the test pattern instead of inventing fixed channels.
+
+### Validation
+- All 97 Rust tests, formatting, warnings-denied Clippy, dashboard syntax and release metadata checks passed. Launcher packaging and native-build safety tests passed; launcher packages remain unpublished.
+- The native v0.8.0 artifact passed on-TV SHA-256, service, verified HTTPS pairing, legacy-pin identity migration, DTLS and SSE checks with zero automatic service restarts. HDMI capture returned to 60 FPS; Home released capture and paused outputs; returning to HDMI resumed them. Manual Stop survived input changes.
+- Disabling Hue left Nanoleaf and capture running; disabling Nanoleaf left Hue running. Both outputs were restored. Pairing replaced only Hue credentials/identity and preserved Nanoleaf configuration.
+- Competing-owner runtime testing was intentionally omitted at the maintainer's request; ownership guards have host-test coverage only. Colour accuracy, CPU impact and packet-loss performance were not measured.
+- The maintainer confirmed both Hue and Nanoleaf visibly syncing after restoration; this was a functional visual check, not a colour-accuracy or latency measurement.
+- The cached Docker fallback also compiled. Published daemon assets are built independently by Docker CI and are not the TV-tested native artifact.
+
 ## [0.7.0] - 2026-10-22
 
 ### Added

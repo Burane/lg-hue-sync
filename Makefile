@@ -253,7 +253,7 @@ root: require-tv
 
 ## pair Hue Bridge and discover entertainment zones
 pair: require-tv
-	uv run scripts/pair_hue.py --tv-ip $(TV_IP)
+	ssh -t $(SSH_OPTS) root@$(TV_IP) "$(REMOTE_DIR)/lg-hue-sync pair --output $(REMOTE_DIR)/config.json && systemctl restart lg-hue-sync"
 
 ## clean cargo target directory
 clean:

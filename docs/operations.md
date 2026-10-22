@@ -343,3 +343,29 @@ independent Nanoleaf output. Host fixtures and ARM compilation do not establish 
 Measure CPU and packet-loss behavior before claiming a performance improvement from cached
 50 Hz repetitions. A 2 Hz repeat remained below Hue's timeout, but was below its recommended
 continuous transport cadence.
+
+### v0.8.0 device validation (2026-10-22)
+
+The native ARMv7 artifact's SHA-256 matched the installed TV binary. Verified HTTPS
+pairing and legacy-pin-to-Bridge-ID migration succeeded. The initial migration preserved
+credentials and configuration except for the new Bridge ID; explicit re-pairing then saved
+new Hue credentials while retaining Nanoleaf configuration and the selected layout.
+
+Home caused `unsupported_source`, zero capture/update rates, released hardware and
+both output flags false. Returning to the original HDMI input restored hardware capture
+at 60 FPS and both outputs. Manual Stop remained paused across Home/HDMI changes;
+explicit Start restored both outputs. Disabling either output left the other and capture
+running; both output settings were restored. The service reported zero automatic restarts.
+
+The maintainer confirmed both Hue and Nanoleaf visibly syncing after restoration;
+this was not a calibrated colour or latency measurement.
+
+The first DTLS attempt timed out once, then retry connected; later resume handshakes
+succeeded. Competing-owner runtime testing was omitted at the maintainer's direction;
+this is not a claim of validated multi-client behavior. Physical colour accuracy, CPU
+impact and packet-loss resilience were not measured. Docker CI publishes a separately
+built artifact; native TV results do not establish runtime validation of that binary.
+
+`make pair TV_IP=<tv-ip>` now invokes the TV's Rust pairing command over SSH and
+restarts the daemon only after successful pairing. The deprecated Python wrapper is
+for host-side pairing and intentionally rejects its removed `--tv-ip` option.
