@@ -22,7 +22,7 @@ pub static REINIT: AtomicBool = AtomicBool::new(false);
 /// Policy-callback trampoline: records the "video pipeline changed" event and
 /// reports it unhandled, mirroring the official app's callback; the next
 /// capture call re-initializes the histogram session.
-unsafe extern "C" fn policy_trampoline() -> bool {
+pub(crate) unsafe extern "C" fn policy_trampoline() -> bool {
     REINIT.store(true, Ordering::SeqCst);
     false
 }
@@ -45,9 +45,9 @@ pub fn zone_summary(entry: &VtHistogramEntry) -> (u64, u64, u64) {
 }
 
 /// Same as `zone_summary` under the u16 interpretation: each block is 256
-/// little-endian `u16` bins. Kept for on-device cross-checks of the bin
-/// semantics (u8 vs u16 is settled by the probe's raw first-byte dumps).
-#[allow(dead_code)]
+/// little-endian `u16` bins. Consumed by `zone_to_rgb` while u8-vs-u16 bin
+/// semantics await on-device confirmation (u8 vs u16 is settled by the probe's
+/// raw first-byte dumps).
 pub fn zone_summary_u16(entry: &VtHistogramEntry) -> (u64, u64, u64) {
     (
         u16_block_sum(&entry.channels[0..512]),
@@ -285,6 +285,11 @@ mod tests {
 
     #[test]
     fn try_new_fails_cleanly_without_libvtcapture() {
+        if Path::new(LIBVTCAPTURE_PATH).exists() {
+            // On a TV the real driver is present and try_new would dlopen it;
+            // this test only asserts the clean host-side failure path.
+            return;
+        }
         let error = HistogramProbe::try_new().expect_err("host has no /usr/lib/libvtcapture.so.1");
         let message = format!("{error:#}");
         assert!(

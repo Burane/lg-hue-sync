@@ -1,4 +1,5 @@
 pub mod dile_vt;
+pub mod histogram;
 pub mod histogram_probe;
 pub mod histogram_types;
 pub mod vtcapture;
@@ -96,6 +97,9 @@ pub trait ScreenCapture {
 }
 
 pub use dile_vt::{DileVtCapture, MockCapture, detect_source_fps};
+// Consumed by the runtime wiring once the histogram backend is selected (Task 4-5).
+#[allow(unused_imports)]
+pub use histogram::HistogramCapture;
 pub use vtcapture::VtCapture;
 
 /// Creates a screen capture instance, prioritizing libvtcapture (webOS 6.x / C1 OLED),

@@ -1607,8 +1607,8 @@ async fn run_test_capture(
     raw_nv12_stats: bool,
     histogram: bool,
 ) -> Result<()> {
-    let config = Config::load(&config_path)?;
     if histogram {
+        // The probe runs without a config file so it can be used on a fresh TV.
         if raw_nv12_stats {
             warn!("--raw-nv12-stats is ignored: --histogram runs the histogram capture probe");
         }
@@ -1617,6 +1617,7 @@ async fn run_test_capture(
         probe.run(20, Duration::from_millis(100), 0, 16);
         return Ok(());
     }
+    let config = Config::load(&config_path)?;
     if raw_nv12_stats {
         info!(
             "TV reports {} mode; this does not establish the capture colour space",
