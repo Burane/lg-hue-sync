@@ -1,3 +1,4 @@
+pub mod auto;
 pub mod dile_vt;
 pub mod histogram;
 pub mod histogram_probe;
@@ -98,15 +99,17 @@ pub trait ScreenCapture {
     }
 }
 
+pub use auto::AutoCapture;
 pub use dile_vt::{DileVtCapture, MockCapture, detect_source_fps};
 pub use histogram::HistogramCapture;
 pub use vtcapture::VtCapture;
 
 /// The classic frame-based chain, tried in order: libvtcapture
 /// (webOS 6.x / C1 OLED), legacy libdile_vt, and finally synthetic MockCapture.
-/// Behavior and log messages are unchanged from the pre-`capture_backend`
+/// Shared by the `Frame` mode and `AutoCapture`'s primary backend; behavior
+/// and log messages are unchanged from the pre-`capture_backend`
 /// implementation.
-fn create_frame_capture(width: u32, height: u32) -> Box<dyn ScreenCapture> {
+pub(crate) fn create_frame_capture(width: u32, height: u32) -> Box<dyn ScreenCapture> {
     // 1. Try modern webOS libvtcapture (/usr/lib/libvtcapture.so.1)
     match VtCapture::try_new(width, height) {
         Ok(capture) => {
@@ -163,12 +166,13 @@ fn create_frame_capture(width: u32, height: u32) -> Box<dyn ScreenCapture> {
 ///   preset 0 (video); on failure (e.g. a TV without the histogram symbols)
 ///   logs a warning and degrades to the frame chain so the TV still gets a
 ///   working capture.
-/// - [`CaptureBackendMode::Auto`]: currently the frame chain.
-///   Task 5 replaces with AutoCapture (frame→histogram fallback).
+/// - [`CaptureBackendMode::Auto`]: [`AutoCapture`] — the frame chain while
+///   healthy, switching to the histogram backend while frames come back
+///   black (DRM playback), with hysteresis in both directions.
 pub fn create_capture(width: u32, height: u32, mode: CaptureBackendMode) -> Box<dyn ScreenCapture> {
     match mode {
-        // Task 5 replaces with AutoCapture (frame→histogram fallback).
-        CaptureBackendMode::Auto | CaptureBackendMode::Frame => create_frame_capture(width, height),
+        CaptureBackendMode::Auto => AutoCapture::try_new(width, height),
+        CaptureBackendMode::Frame => create_frame_capture(width, height),
         CaptureBackendMode::Histogram => match HistogramCapture::try_new(width, height, 0) {
             Ok(capture) => Box::new(capture),
             Err(e) => {
