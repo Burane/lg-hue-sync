@@ -61,12 +61,64 @@ fn u8_block_sum(block: &[u8]) -> u64 {
 }
 
 fn u16_block_sum(block: &[u8]) -> u64 {
+    u16_bins(block).sum()
+}
+
+/// The block's 256 little-endian `u16` bin counts.
+fn u16_bins(block: &[u8]) -> impl Iterator<Item = u64> + '_ {
     block
         .as_chunks::<2>()
         .0
         .iter()
         .map(|pair| u64::from(u16::from_le_bytes(*pair)))
-        .sum()
+}
+
+/// Highest-count bin index and its count. Ties keep the lowest bin index; an
+/// all-zero block reports bin 0 with count 0.
+fn bins_argmax(bins: impl Iterator<Item = u64>) -> (usize, u64) {
+    let mut best = (0, 0);
+    for (index, count) in bins.enumerate() {
+        if count > best.1 {
+            best = (index, count);
+        }
+    }
+    best
+}
+
+/// Count-weighted mean bin level: `sum(i * count[i]) / sum(count[i])`, 0.0
+/// when every count is zero.
+fn bins_weighted_mean(bins: impl Iterator<Item = u64>) -> f64 {
+    let mut weighted = 0u64;
+    let mut total = 0u64;
+    for (index, count) in bins.enumerate() {
+        weighted += index as u64 * count;
+        total += count;
+    }
+    if total == 0 {
+        0.0
+    } else {
+        weighted as f64 / total as f64
+    }
+}
+
+/// `bins_argmax` over the block's 256 u8 bins.
+fn u8_argmax(block: &[u8]) -> (usize, u64) {
+    bins_argmax(block.iter().map(|&byte| u64::from(byte)))
+}
+
+/// `bins_weighted_mean` over the block's 256 u8 bins.
+fn u8_weighted_mean(block: &[u8]) -> f64 {
+    bins_weighted_mean(block.iter().map(|&byte| u64::from(byte)))
+}
+
+/// `bins_argmax` over the block's 256 little-endian u16 bins.
+fn u16_argmax(block: &[u8]) -> (usize, u64) {
+    bins_argmax(u16_bins(block))
+}
+
+/// `bins_weighted_mean` over the block's 256 little-endian u16 bins.
+fn u16_weighted_mean(block: &[u8]) -> f64 {
+    bins_weighted_mean(u16_bins(block))
 }
 
 /// On-device diagnostic probe for the histogram capture API. Never writes
@@ -207,21 +259,45 @@ impl HistogramProbe {
     }
 }
 
-/// Logs the per-zone channel sums, with a raw 8-byte hex dump of the first
-/// channel for zones 0 and last (u8-vs-u16 disambiguation). Shared verbatim by
-/// the libvtcapture probe and the direct V4L2 probe.
+/// Logs, per zone: the channel sums; for each of the three 512-byte channel
+/// blocks the argmax bin (index + count) and the count-weighted mean bin
+/// level under BOTH bin interpretations (u8 and u16 little-endian); the raw
+/// 8-byte hex dump of the first channel for zones 0 and last
+/// (u8-vs-u16 disambiguation); and, for zone 0, the FULL first channel block
+/// (512 bytes) as hex, 32 bytes per line. Shared verbatim by the libvtcapture
+/// probe and the direct V4L2 probe.
 fn log_zone_summaries(buffer: &HistogramBuffer) {
     let last = buffer.zones().saturating_sub(1);
     for zone in 0..buffer.zones() {
-        let (channel0, channel1, channel2) = zone_summary(buffer.entry(zone));
+        let entry = buffer.entry(zone);
+        let (channel0, channel1, channel2) = zone_summary(entry);
         info!("  zone {zone:2}: sums=({channel0}, {channel1}, {channel2})");
+        for (channel, block) in entry.channels.as_chunks::<512>().0.iter().enumerate() {
+            let (u8_bin, u8_count) = u8_argmax(block);
+            let u8_mean = u8_weighted_mean(block);
+            let (u16_bin, u16_count) = u16_argmax(block);
+            let u16_mean = u16_weighted_mean(block);
+            info!(
+                "  zone {zone:2}: ch{channel}: u8 argmax=bin {u8_bin} (count {u8_count}) mean={u8_mean:.1}; u16 argmax=bin {u16_bin} (count {u16_count}) mean={u16_mean:.1}"
+            );
+        }
         if zone == 0 || zone == last {
-            let raw = buffer.entry(zone).channels[..8]
+            let raw = entry.channels[..8]
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<Vec<_>>()
                 .join(" ");
             info!("  zone {zone:2}: first channel bytes: {raw}");
+        }
+        if zone == 0 {
+            for (line, chunk) in entry.channels[..512].as_chunks::<32>().0.iter().enumerate() {
+                let hex = chunk
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                info!("  zone  0: ch0 hex @{:03x}: {hex}", line * 32);
+            }
         }
     }
 }
@@ -246,22 +322,27 @@ const VIDIOC_S_EXT_CTRLS: libc::c_ulong = 0xc018_5648;
 /// `VIDIOC_G_EXT_CTRLS`, same ABI.
 const VIDIOC_G_EXT_CTRLS: libc::c_ulong = 0xc018_5647;
 
-/// `struct v4l2_ext_control` exactly as laid out for the TV's 32-bit ARM ABI
-/// (20 bytes). The trailing union member is 4 bytes on ARM32 (a raw value for
-/// the value controls, or a buffer pointer for the payload control); it is
-/// stored as `u32` so the layout stays fixed-width on 64-bit hosts, where the
-/// size unit tests run. Pointer payloads are cast `as usize as u32`, lossless
-/// on the ARM32 target that is the only caller reaching the ioctl.
+/// `struct v4l2_ext_control` exactly as the kernel UAPI lays it out for the
+/// TV's 32-bit ARM ABI: id@0, size@4, reserved2@8, then the 8-byte-wide
+/// packed union at @12 (`value64`/pointers make it 8 bytes; this code only
+/// uses the union's 4-byte members — a raw value for the value controls, or
+/// a buffer pointer for the payload control) with `reserved3` as the union's
+/// tail, keeping the 20-byte packed stride. Fields are stored as fixed-width
+/// `u32` so the layout is identical on 64-bit hosts, where the size unit
+/// tests run. Pointer payloads are cast `as usize as u32`, lossless on the
+/// ARM32 target that is the only caller reaching the ioctl.
 #[repr(C)]
 struct V4l2ExtControl {
     id: u32,
     size: u32,
-    reserved: [u32; 2],
+    reserved2: u32,
     value_or_ptr: u32,
+    reserved3: u32,
 }
 
-/// `struct v4l2_ext_controls` (24 bytes, 32-bit ARM ABI; `controls` uses the
-/// same fixed-width pointer storage as [`V4l2ExtControl`]).
+/// `struct v4l2_ext_controls` (24 bytes, 32-bit ARM ABI; `controls` sits at
+/// byte 20 and uses the same fixed-width pointer storage as
+/// [`V4l2ExtControl`]).
 #[repr(C)]
 struct V4l2ExtControls {
     which: u32,
@@ -323,8 +404,9 @@ fn direct_sequence(
     let mut enable = V4l2ExtControl {
         id: CTRL_HISTOGRAM_ENABLE,
         size: 0,
-        reserved: [0; 2],
+        reserved2: 0,
         value_or_ptr: 0,
+        reserved3: 0,
     };
     let mut ctrls = build_ext_controls(&mut enable);
     ext_ctrls(fd, VIDIOC_S_EXT_CTRLS, &mut ctrls, "enable")?;
@@ -333,8 +415,9 @@ fn direct_sequence(
     let mut preset_ctrl = V4l2ExtControl {
         id: CTRL_HISTOGRAM_PRESET,
         size: 0,
-        reserved: [0; 2],
+        reserved2: 0,
         value_or_ptr: preset as u32,
+        reserved3: 0,
     };
     let mut ctrls = build_ext_controls(&mut preset_ctrl);
     ext_ctrls(fd, VIDIOC_S_EXT_CTRLS, &mut ctrls, "preset")?;
@@ -346,8 +429,9 @@ fn direct_sequence(
         let mut data = V4l2ExtControl {
             id: CTRL_HISTOGRAM_DATA,
             size: (zones * ENTRY_SIZE) as u32,
-            reserved: [0; 2],
+            reserved2: 0,
             value_or_ptr: buffer.as_mut_ptr() as usize as u32,
+            reserved3: 0,
         };
         let mut ctrls = build_ext_controls(&mut data);
         ext_ctrls(fd, VIDIOC_G_EXT_CTRLS, &mut ctrls, "get")?;
@@ -471,12 +555,40 @@ mod tests {
     }
 
     #[test]
+    fn direct_ext_ctrl_field_offsets_match_kernel_packed_union() {
+        // The kernel reads the ext_control union at byte 12: a payload pointer
+        // placed at any other offset is read as NULL (EFAULT) or garbage.
+        let mut ctrl = V4l2ExtControl {
+            id: 1,
+            size: 2,
+            reserved2: 3,
+            value_or_ptr: 4,
+            reserved3: 5,
+        };
+        let base = std::ptr::addr_of!(ctrl) as usize;
+        assert_eq!(
+            std::ptr::addr_of!(ctrl.value_or_ptr) as usize - base,
+            12,
+            "value/pointer union member must sit at the kernel's packed offset 12"
+        );
+
+        let ctrls = build_ext_controls(&mut ctrl);
+        let wrapper_base = std::ptr::addr_of!(ctrls) as usize;
+        assert_eq!(
+            std::ptr::addr_of!(ctrls.controls) as usize - wrapper_base,
+            20,
+            "controls pointer must sit at the kernel's offset 20"
+        );
+    }
+
+    #[test]
     fn build_ext_controls_wraps_single_user_class_control() {
         let mut ctrl = V4l2ExtControl {
             id: CTRL_HISTOGRAM_DATA,
             size: (ZONES_PER_PRESET[0] * ENTRY_SIZE) as u32,
-            reserved: [0; 2],
+            reserved2: 0,
             value_or_ptr: 0,
+            reserved3: 0,
         };
         // The payload control requests all 16 preset-0 zones in one ioctl.
         assert_eq!(ctrl.size, 0x6040);
@@ -493,6 +605,46 @@ mod tests {
             std::ptr::addr_of_mut!(ctrl) as usize & u32::MAX as usize,
             "wrapper must carry the control's 32-bit ARM address"
         );
+    }
+
+    #[test]
+    fn u8_bin_helpers_argmax_and_weighted_mean() {
+        let mut block = [0u8; 512];
+        assert_eq!(
+            u8_argmax(&block),
+            (0, 0),
+            "all-zero block reports bin 0 count 0"
+        );
+        assert_eq!(u8_weighted_mean(&block), 0.0, "zero total count means 0.0");
+
+        // Review example: count 10 at bin 5, count 5 at bin 100.
+        block[5] = 10;
+        block[100] = 5;
+        assert_eq!(u8_argmax(&block), (5, 10));
+        let mean = u8_weighted_mean(&block);
+        assert_eq!(mean, (5.0 * 10.0 + 100.0 * 5.0) / 15.0);
+        assert_eq!(format!("{mean:.1}"), "36.7", "mean prints with 1 decimal");
+
+        // Ties keep the lowest bin index.
+        block[5] = 5;
+        assert_eq!(u8_argmax(&block), (5, 5));
+    }
+
+    #[test]
+    fn u16_bin_helpers_argmax_and_weighted_mean_are_little_endian() {
+        let mut block = [0u8; 512];
+        assert_eq!(u16_argmax(&block), (0, 0));
+        assert_eq!(u16_weighted_mean(&block), 0.0);
+
+        // bin 2 count 300 = bytes 2c 01 little-endian; bin 200 count 7.
+        block[4..6].copy_from_slice(&300u16.to_le_bytes());
+        block[400..402].copy_from_slice(&7u16.to_le_bytes());
+        // A big-endian read of bin 2 would report 0x2c01 = 11265, so the
+        // count assertion locks the byte order.
+        assert_eq!(u16_argmax(&block), (2, 300));
+        let mean = u16_weighted_mean(&block);
+        assert_eq!(mean, (2.0 * 300.0 + 200.0 * 7.0) / 307.0);
+        assert_eq!(format!("{mean:.1}"), "6.5");
     }
 
     #[test]
