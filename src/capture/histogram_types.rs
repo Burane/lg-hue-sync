@@ -11,9 +11,28 @@ pub const LIBVTCAPTURE_PATH: &str = "/usr/lib/libvtcapture.so.1";
 /// Zone counts for the four native histogram presets: [16, 16, 16, 14].
 pub const ZONES_PER_PRESET: [usize; 4] = [16, 16, 16, 14];
 
-/// Presumed zone arrangement within a preset; row-major hypothesis, to be
-/// validated on-device before it is used for light placement.
-pub const ZONE_GRID: (u32, u32) = (4, 4);
+/// Screen rect `(x0, y0, x1, y1)` of each preset-0 (video) zone, normalised
+/// to 0..1 with y pointing down. Decoded from the official Hue Sync app's
+/// zone table (hue_sync_service `FUN_000558b0`, records 0..15): the zones
+/// overlap (halves, centre column, corners, edge strips) and are not a grid.
+pub const ZONE_RECTS: [(f32, f32, f32, f32); 16] = [
+    (0.25, 0.0, 0.75, 1.0), // 0 centre column
+    (0.2, 0.8, 0.8, 1.0),   // 1 bottom centre
+    (0.3, 0.3, 0.7, 0.7),   // 2 centre
+    (0.1, 0.0, 0.4, 0.2),   // 3 top, left of centre
+    (0.0, 0.0, 0.5, 1.0),   // 4 left half
+    (0.0, 0.67, 0.29, 1.0), // 5 bottom-left
+    (0.0, 0.24, 0.2, 0.76), // 6 left middle
+    (0.0, 0.0, 0.3, 0.375), // 7 top-left
+    (0.5, 0.0, 1.0, 1.0),   // 8 right half
+    (0.7, 0.67, 1.0, 1.0),  // 9 bottom-right
+    (0.8, 0.24, 1.0, 0.76), // 10 right middle
+    (0.35, 0.0, 0.65, 0.2), // 11 top centre
+    (0.6, 0.0, 0.9, 0.2),   // 12 top, right of centre
+    (0.7, 0.0, 1.0, 0.375), // 13 top-right
+    (0.3, 0.0, 0.7, 0.127), // 14 top band
+    (0.0, 0.3, 0.13, 0.7),  // 15 left band
+];
 
 /// Per-zone channel payload: three 512-byte channel blocks.
 pub const CHANNEL_BYTES: usize = 3 * 512;

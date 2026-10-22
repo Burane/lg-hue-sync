@@ -10,7 +10,7 @@ use super::histogram_probe::{u8_weighted_mean, u16_weighted_mean};
 use super::histogram_types::{
     CTRL_HISTOGRAM_DATA, CTRL_HISTOGRAM_ENABLE, CTRL_HISTOGRAM_PRESET, ENTRY_SIZE,
     HISTOGRAM_V4L2_DEVICE, HistogramBuffer, V4l2ExtControl, V4l2ExtControls, VIDIOC_G_EXT_CTRLS,
-    VIDIOC_S_EXT_CTRLS, VtHistogramEntry, ZONE_GRID, ZONES_PER_PRESET, build_ext_controls,
+    VIDIOC_S_EXT_CTRLS, VtHistogramEntry, ZONE_RECTS, ZONES_PER_PRESET, build_ext_controls,
 };
 use super::{CaptureError, CapturedFrame, NativeCaptureError, ScreenCapture};
 
@@ -342,7 +342,7 @@ fn preset_error_context(rc: i32) -> &'static str {
 }
 
 /// Production capture backend rendering the reverse-engineered webOS
-/// 25 histogram device into a `ZONE_GRID` BGRA canvas, one rect per zone.
+/// 25 histogram device into a BGRA canvas laid out by [`ZONE_RECTS`].
 ///
 /// Generic over the device seam; [`HistogramCapture`] is the production
 /// alias bound to [`V4l2HistogramLib`].
@@ -354,15 +354,49 @@ pub struct HistogramCaptureImpl<L: HistogramLib> {
     height: u32,
     buffer: HistogramBuffer,
     canvas: Vec<u8>,
+    /// Zone painted at each canvas pixel, from [`zone_owner_map`].
+    owners: Vec<u8>,
+}
+
+/// For every pixel of a `width`x`height` canvas, the [`ZONE_RECTS`] zone it
+/// shows: the smallest rect covering the pixel centre (the most local
+/// statistic), ties going to the nearer rect centre. Zones 4 and 8 tile the
+/// screen, so every pixel has an owner.
+fn zone_owner_map(width: u32, height: u32) -> Vec<u8> {
+    let mut owners = Vec::with_capacity(width as usize * height as usize);
+    for y in 0..height {
+        let py = (y as f32 + 0.5) / height as f32;
+        for x in 0..width {
+            let px = (x as f32 + 0.5) / width as f32;
+            let score = |&(x0, y0, x1, y1): &(f32, f32, f32, f32)| {
+                let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+                ((x1 - x0) * (y1 - y0), (px - cx).powi(2) + (py - cy).powi(2))
+            };
+            let owner = (0..ZONE_RECTS.len())
+                .filter(|&zone| {
+                    let (x0, y0, x1, y1) = ZONE_RECTS[zone];
+                    (x0..x1).contains(&px) && (y0..y1).contains(&py)
+                })
+                .min_by(|&a, &b| {
+                    score(&ZONE_RECTS[a])
+                        .partial_cmp(&score(&ZONE_RECTS[b]))
+                        .unwrap()
+                })
+                .expect("zones 4 and 8 tile the screen");
+            owners.push(owner as u8);
+        }
+    }
+    owners
 }
 
 impl<L: HistogramLib> HistogramCaptureImpl<L> {
     /// Arms a session over an already-open seam: init + set_preset.
     fn with_lib(mut lib: L, width: u32, height: u32, preset: i32) -> Result<Self> {
+        // ponytail: only preset 0's geometry is wired; add the other
+        // presets' rects from the app's zone table if they are ever used.
         ensure!(
-            (0..ZONES_PER_PRESET.len() as i32).contains(&preset),
-            "bad preset {preset}: histogram presets are 0..{}",
-            ZONES_PER_PRESET.len()
+            preset == 0,
+            "bad preset {preset}: only preset 0 (video) has a known zone geometry"
         );
         let handle = lib.init();
         if handle.is_null() {
@@ -417,34 +451,24 @@ impl<L: HistogramLib> HistogramCaptureImpl<L> {
             height,
             buffer: HistogramBuffer::new(zones),
             canvas: vec![0; width as usize * height as usize * 4],
+            owners: zone_owner_map(width, height),
         })
     }
 
-    /// Renders one histogram buffer into the BGRA zone-grid canvas.
+    /// Renders one histogram buffer into the BGRA zone canvas.
     fn render(&mut self) {
-        for pixel in self.canvas.as_chunks_mut::<4>().0 {
-            *pixel = [0, 0, 0, 255];
-        }
-        let (grid_w, grid_h) = ZONE_GRID;
-        let (width, height) = (self.width, self.height);
-        for zone in 0..self.buffer.zones() {
-            let (r, g, b) = zone_to_rgb(self.buffer.entry(zone), BIN_LAYOUT, CHANNEL_ORDER);
-            let row = (zone as u32) / grid_w;
-            let col = (zone as u32) % grid_w;
-            let x0 = col * width / grid_w;
-            let x1 = (col + 1) * width / grid_w;
-            let y0 = row * height / grid_h;
-            let y1 = (row + 1) * height / grid_h;
-            for y in y0..y1 {
-                for x in x0..x1 {
-                    let offset = ((y * width + x) * 4) as usize;
-                    let pixel = &mut self.canvas[offset..offset + 4];
-                    pixel[0] = b;
-                    pixel[1] = g;
-                    pixel[2] = r;
-                    pixel[3] = 255;
-                }
-            }
+        let colors: Vec<(u8, u8, u8)> = (0..self.buffer.zones())
+            .map(|zone| zone_to_rgb(self.buffer.entry(zone), BIN_LAYOUT, CHANNEL_ORDER))
+            .collect();
+        for (pixel, &owner) in self
+            .canvas
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(&self.owners)
+        {
+            let (r, g, b) = colors[owner as usize];
+            *pixel = [b, g, r, 255];
         }
     }
 }
@@ -857,49 +881,42 @@ mod tests {
         }
     }
 
-    // 10. Canvas geometry: zone 5 (row 1, col 1) pure red in exactly its rect.
+    // 10. Canvas geometry follows the official app's overlapping zone rects,
+    // not a grid: each probe point shows the smallest zone covering it.
     #[test]
-    fn canvas_geometry_maps_zone_five_to_its_grid_rect() {
+    fn canvas_geometry_follows_official_zone_rects() {
+        // Zone z reports one count at R level 10*z + 5, so a pixel's red
+        // value names the zone painted there.
         let lib = FakeHistogramLib::new().with_fill(|entry| {
-            if entry.index == 5 {
-                // All counts in bin 255 (bytes 510..512 of the R block, the
-                // top u16 bin): count 255 at level 255 -> mean 255 -> 255,
-                // pure red under the U16x256 semantics.
-                entry.channels[511] = 0xFF;
-            }
+            let level = 10 * entry.index as usize + 5;
+            entry.channels[2 * level] = 1;
         });
         let mut capture = capture(lib);
-
         let frame = capture.acquire_frame().expect("geometry frame");
-        assert_eq!(frame.data.len(), (TEST_WIDTH * TEST_HEIGHT * 4) as usize);
 
-        let width = TEST_WIDTH as usize;
-        let pixel = |x: usize, y: usize| -> [u8; 4] {
-            let offset = (y * width + x) * 4;
-            frame.data[offset..offset + 4].try_into().unwrap()
+        let (w, h) = (TEST_WIDTH as f32, TEST_HEIGHT as f32);
+        let zone_at = |fx: f32, fy: f32| -> u8 {
+            let (x, y) = ((fx * w) as usize, (fy * h) as usize);
+            let red = frame.data[(y * TEST_WIDTH as usize + x) * 4 + 2];
+            (red - 5) / 10
         };
-        // Rect for zone 5: x in [80, 160), y in [45, 90). Corners and centre.
-        for y in [45, 67, 89] {
-            for x in [80, 120, 159] {
-                assert_eq!(pixel(x, y), [0, 0, 255, 255], "inside rect ({x},{y})");
-            }
+        for (fx, fy, zone) in [
+            (0.02, 0.02, 7),  // top-left
+            (0.98, 0.02, 13), // top-right
+            (0.02, 0.98, 5),  // bottom-left
+            (0.98, 0.98, 9),  // bottom-right
+            (0.5, 0.5, 2),    // centre
+            (0.5, 0.95, 1),   // bottom centre
+            (0.5, 0.05, 14),  // top band
+            (0.5, 0.15, 11),  // top centre, below the band
+            (0.02, 0.5, 15),  // left band
+            (0.17, 0.5, 6),   // left middle, inside the band
+            (0.9, 0.5, 10),   // right middle
+            (0.27, 0.5, 4),   // left half, nearer its centre than zone 0's
+            (0.73, 0.5, 8),   // right half
+        ] {
+            assert_eq!(zone_at(fx, fy), zone, "zone at ({fx}, {fy})");
         }
-
-        let mut red = 0;
-        for (i, px) in frame.data.chunks_exact(4).enumerate() {
-            let x = (i as u32) % TEST_WIDTH;
-            let y = (i as u32) / TEST_WIDTH;
-            if px[2] == 255 {
-                assert!(
-                    (80..160).contains(&x) && (45..90).contains(&y),
-                    "red pixel outside the rect at ({x},{y})"
-                );
-                red += 1;
-            } else {
-                assert_eq!(px, [0, 0, 0, 255], "pixel ({x},{y}) must be opaque black");
-            }
-        }
-        assert_eq!(red, 80 * 45, "exactly the rect's pixels may be red");
     }
 
     // 11. zone_to_rgb: count-weighted mean level, scaling, and saturation.

@@ -66,9 +66,11 @@ The histogram path is DRM-safe: the video hardware computes the histograms upstr
 secure frame path, so the frame-dump blackout does not apply. Live, varied per-zone data
 was confirmed on-device during DRM-protected playback in a native app. Each zone's colour
 is the count-weighted mean bin level per channel — the bin index is the level, so the mean
-maps directly onto 0–255 — giving an RGB triple per zone. The sixteen triples are
-block-painted onto a 4×4 canvas consumed by the existing spatial sampling and per-light
-zone rectangles; no separate zone-mapping table exists.
+maps directly onto 0–255 — giving an RGB triple per zone. The sixteen zones are not a
+grid: they are the overlapping screen rectangles (halves, centre column, corners, edge
+strips) of the official Hue Sync app's preset-0 zone table, recorded as `ZONE_RECTS`.
+Each canvas pixel is painted with the smallest zone covering it, and the canvas feeds the
+existing spatial sampling and per-light zone rectangles.
 
 The `capture_backend` setting selects `frame`, `histogram`, or `auto` (the default). `auto`
 prefers frame capture and switches to histogram after 30 consecutive all-black frames
