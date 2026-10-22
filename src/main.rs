@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Level, error, info, warn};
 use tracing_subscriber::FmtSubscriber;
 
-use capture::histogram_probe::HistogramProbe;
+use capture::histogram_probe::{HistogramProbe, probe_direct};
 use capture::{
     CaptureRecovery, MockCapture, RecoveryAction, ScreenCapture, VtCapture, create_capture,
     detect_source_fps,
@@ -72,6 +72,9 @@ enum Commands {
         /// Probe the webOS 24/25 histogram capture API (diagnostic; no light output, no frame files)
         #[arg(long)]
         histogram: bool,
+        /// Probe /dev/video60 with raw V4L2 ioctls, bypassing libvtcapture and the Luna resource manager (diagnostic; no light output, no frame files)
+        #[arg(long)]
+        histogram_direct: bool,
     },
     /// Discover and pair with a Philips Hue Bridge via pushlink button
     Pair {
@@ -113,7 +116,8 @@ async fn main() -> Result<()> {
             config,
             raw_nv12_stats,
             histogram,
-        } => run_test_capture(config, raw_nv12_stats, histogram).await,
+            histogram_direct,
+        } => run_test_capture(config, raw_nv12_stats, histogram, histogram_direct).await,
         Commands::Pair { bridge, output } => run_pair(bridge, output).await,
         Commands::SyncHue { config, area } => run_sync_hue(config, area).await,
         Commands::PairNanoleaf { ip, config } => run_pair_nanoleaf(ip, config).await,
@@ -1618,7 +1622,20 @@ async fn run_test_capture(
     config_path: PathBuf,
     raw_nv12_stats: bool,
     histogram: bool,
+    histogram_direct: bool,
 ) -> Result<()> {
+    if histogram_direct {
+        // The direct probe bypasses libvtcapture and the Luna resource manager
+        // entirely; it runs without a config file so it works on a fresh TV.
+        if histogram {
+            warn!("--histogram is ignored: --histogram-direct runs the direct V4L2 probe");
+        }
+        if raw_nv12_stats {
+            warn!("--raw-nv12-stats is ignored: --histogram-direct runs the direct V4L2 probe");
+        }
+        probe_direct(20, Duration::from_millis(100), 0, 16)?;
+        return Ok(());
+    }
     if histogram {
         // The probe runs without a config file so it can be used on a fresh TV.
         if raw_nv12_stats {
