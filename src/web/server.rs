@@ -282,7 +282,7 @@ pub struct SharedState {
     pub fps_x100: AtomicU32,
     /// Successful light-output updates measured over the preceding second.
     pub light_updates_x100: AtomicU32,
-    pub hue_bridge_ip: String,
+    pub hue_bridge_ip: RwLock<String>,
     pub nanoleaf_ip: RwLock<String>,
     pub hue_connected: AtomicBool,
     pub nanoleaf_connected: AtomicBool,
@@ -316,7 +316,7 @@ impl SharedState {
             command_tx,
             fps_x100: AtomicU32::new(6000),
             light_updates_x100: AtomicU32::new(0),
-            hue_bridge_ip,
+            hue_bridge_ip: RwLock::new(hue_bridge_ip),
             nanoleaf_ip: RwLock::new(nanoleaf_ip),
             hue_connected: AtomicBool::new(false),
             nanoleaf_connected: AtomicBool::new(false),
@@ -541,7 +541,7 @@ async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
         fps: shared.get_fps(),
         light_update_fps: shared.light_update_fps(),
         hue_connected: shared.hue_connected.load(Ordering::Relaxed),
-        hue_bridge_ip: shared.hue_bridge_ip.clone(),
+        hue_bridge_ip: shared.hue_bridge_ip.read().unwrap().clone(),
         nanoleaf_connected: shared.nanoleaf_connected.load(Ordering::Relaxed),
         nanoleaf_ip: shared.nanoleaf_ip.read().unwrap().clone(),
         capture_hardware: shared.capture_hardware.load(Ordering::Relaxed),
@@ -677,12 +677,9 @@ async fn hue_areas(State(state): State<AppState>) -> Result<Json<HueAreasRespons
         if config.bridge_ip.is_empty() || config.username.is_empty() {
             return Err("Pair a Hue Bridge before selecting an Entertainment Area".to_string());
         }
-        let areas = hue::list_entertainment_areas(
-            &config.bridge_ip,
-            &config.username,
-            config.hue_bridge_certificate_sha256.as_deref(),
-        )
-        .map_err(|error| error.to_string())?;
+        let areas =
+            hue::list_entertainment_areas(&config.bridge_ip, &config.username, config.hue_trust())
+                .map_err(|error| error.to_string())?;
         Ok(HueAreasResponse {
             selected_area_id: config
                 .entertainment_configuration_id
@@ -715,18 +712,20 @@ async fn select_hue_area(
             &config.bridge_ip,
             &config.username,
             Some(&area_id),
-            config.hue_bridge_certificate_sha256.as_deref(),
+            config.hue_trust(),
         )
         .map_err(|error| error.to_string())?;
         Config::update(&config_path, None, |current| {
             if current.bridge_ip != config.bridge_ip
                 || current.username != config.username
                 || current.hue_bridge_certificate_sha256 != config.hue_bridge_certificate_sha256
+                || current.hue_bridge_id != config.hue_bridge_id
             {
                 anyhow::bail!("Hue Bridge configuration changed during area selection; retry");
             }
             current.entertainment_area_id = area.configuration_id.clone();
             current.entertainment_configuration_id = Some(area.configuration_id);
+            current.hue_bridge_id = Some(area.bridge_id.clone());
             current.hue_bridge_certificate_sha256 = Some(area.certificate_sha256);
             current.zones = area.zones;
             Ok(())
@@ -767,21 +766,12 @@ async fn pair_hue(
                 validate_device_ip(&hue::discover_bridge().map_err(|error| error.to_string())?)?
             }
         };
-        let (username, clientkey, area) =
-            hue::pair_bridge(&bridge_ip, 45).map_err(|error| error.to_string())?;
+        let paired = hue::pair_bridge(&bridge_ip, 45).map_err(|error| error.to_string())?;
         Config::update(
             &config_path,
             Some(Config::new_default("", "", "", "")),
             |config| {
-                config.bridge_ip = bridge_ip;
-                config.username = username;
-                config.clientkey = clientkey;
-                config.hue_enabled = true;
-                config.hue_sync_enabled = true;
-                config.entertainment_area_id = area.configuration_id.clone();
-                config.entertainment_configuration_id = Some(area.configuration_id);
-                config.hue_bridge_certificate_sha256 = Some(area.certificate_sha256);
-                config.zones = area.zones;
+                config.apply_hue_pairing(bridge_ip, paired);
                 Ok(())
             },
         )

@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use openssl::ssl::{SslConnector, SslMethod, SslStream, SslVerifyMode};
+use openssl::ssl::{SslConnector, SslMethod, SslStream, SslVerifyMode, SslVersion};
 use std::io::{Read, Write};
 use std::net::{IpAddr, UdpSocket};
 use std::time::{Duration, Instant};
@@ -56,7 +56,10 @@ pub struct HueDtlsClient {
 
 impl HueDtlsClient {
     /// Connect to Hue Bridge DTLS port 2100 with PSK identity and client key
-    pub fn connect(bridge_ip: &str, username: &str, clientkey_hex: &str) -> Result<Self> {
+    pub fn connect(bridge_ip: &str, application_id: &str, clientkey_hex: &str) -> Result<Self> {
+        if !super::valid_configuration_id(application_id) {
+            return Err(anyhow!("Invalid Hue DTLS application ID"));
+        }
         let deadline = Instant::now() + Duration::from_secs(5);
         let psk_bytes = hex_to_bytes(clientkey_hex).with_context(|| {
             "Failed to parse clientkey as hex (must be 32 hex chars / 16 bytes)"
@@ -70,21 +73,24 @@ impl HueDtlsClient {
         let mut builder = SslConnector::builder(SslMethod::dtls())
             .with_context(|| "Failed to create DTLS SSL connector builder")?;
 
-        // Allow PSK ciphers supported by Hue Bridge
+        builder.set_min_proto_version(Some(SslVersion::DTLS1_2))?;
+        builder.set_max_proto_version(Some(SslVersion::DTLS1_2))?;
+        // Hue supports DTLS 1.2 with this PSK cipher.
         builder
-            .set_cipher_list("PSK-AES128-GCM-SHA256:PSK-AES256-GCM-SHA384")
+            .set_cipher_list("PSK-AES128-GCM-SHA256")
             .with_context(|| "Failed to set PSK cipher list")?;
 
         // Disable server certificate verification since Hue uses pre-shared keys
         builder.set_verify(SslVerifyMode::NONE);
 
-        let identity = username.to_string();
+        let identity = application_id.to_string();
         builder.set_psk_client_callback(move |_ssl, _hint, identity_buf, psk_buf| {
             let id_bytes = identity.as_bytes();
-            if id_bytes.len() > identity_buf.len() {
+            if id_bytes.len() >= identity_buf.len() {
                 return Err(openssl::error::ErrorStack::get());
             }
             identity_buf[..id_bytes.len()].copy_from_slice(id_bytes);
+            identity_buf[id_bytes.len()] = 0;
 
             if psk_bytes.len() > psk_buf.len() {
                 return Err(openssl::error::ErrorStack::get());
@@ -144,7 +150,7 @@ impl HueDtlsClient {
                     stream
                         .get_ref()
                         .socket
-                        .set_write_timeout(Some(Duration::from_secs(5)))?;
+                        .set_write_timeout(Some(Duration::from_millis(100)))?;
                     info!("[+] DTLS 1.2 handshake successful with Hue Bridge!");
                     return Ok(Self { stream });
                 }

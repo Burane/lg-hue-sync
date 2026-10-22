@@ -317,3 +317,29 @@ For an existing installation, copy `scripts/log-maintenance.sh` to `/var/home/ro
 - Gradient count unexpected: inspect `entertainment_configuration.channels[].members`; physical segment count differs from stream-channel count.
 - Nanoleaf order wrong: run **4D Tracer**, then adjust corner, direction, and offset under **Calibration**.
 - Standby leaves lights owned: enable **Follow TV power** and inspect transition logs.
+
+## Hue authentication and migration recovery
+
+New pairing uses verified HTTPS and persists the Bridge ID. Existing paired configurations
+keep their credentials and certificate pin. On the first successful identity refresh, an exact
+legacy pin match establishes the saved Bridge ID; later CA-signed certificate renewals are
+validated against that ID. A changed certificate before identity migration requires explicit
+re-pairing. Do not remove the pin to bypass a validation failure.
+
+If several bridges are discovered, supply the intended IP explicitly. If pairing succeeds but
+area discovery fails or several areas exist, credentials are still saved; choose an area in the
+dashboard or run `lg-hue-sync sync-hue --config <path> --area <name-or-id>`. Hue output stays
+unavailable until a valid area is selected. Selecting an area never changes its physical layout.
+
+- Authorization rejected: re-pair using the Bridge button.
+- Area missing after migration: select an existing area explicitly; no arbitrary replacement is chosen.
+- Known layout change with failed refresh: Hue stays disconnected. Retry **Refresh selected area layout** after resolving connectivity.
+- Another application owns the area: Hue suspends independently of Nanoleaf. Use **Start** to retry after that application releases it; no automatic takeover.
+- Bridge IP changed: a failed TCP connection permits identity-scoped rediscovery. TLS identity failures do not permit fallback to another bridge.
+
+Validate on the TV before release: initial pairing, existing-pin migration, automatic address
+recovery, another app's ownership, area edits/deletion, explicit Stop, HDMI/app transitions and
+independent Nanoleaf output. Host fixtures and ARM compilation do not establish these results.
+Measure CPU and packet-loss behavior before claiming a performance improvement from cached
+50 Hz repetitions. A 2 Hz repeat remained below Hue's timeout, but was below its recommended
+continuous transport cadence.

@@ -35,11 +35,24 @@ Start or Restart retries a capture fault. Standby startup does not initialize ca
 worker. Generation checks discard results superseded by stop, disable or area changes; retries
 do not block Nanoleaf or command processing. DTLS handshakes share a five-second deadline;
 Bridge HTTP operations retain their five-second deadline. Shutdown joins the worker after
-invalidating pending connections. A separate instance of the same worker handles periodic
-Bridge status reads in running and paused states. Only one read is pending at a time;
-stop, resume, disable and area changes invalidate old results. Paused auto-resume waits for
-session cleanup to settle before querying the Bridge. Explicit area-refresh requests still
-run synchronously in the daemon loop.
+invalidating pending connections. One bounded SSE worker subscribes before taking its initial
+snapshot and merges partial updates. Reconnection reconciles ownership and layout; generation
+checks discard old subscriptions. Authoritative deletion or rejected authorization blocks Hue;
+transient event transport errors retry with bounded backoff. Layout changes stop cached output
+before refresh; a failed refresh remains blocked until a successful refresh or area selection.
+Ownership loss suspends Hue without stopping Nanoleaf. Manual Start can retry ownership loss.
+Explicit area-refresh requests still run synchronously in the daemon loop.
+
+Hue's application key authorizes HTTPS; the separate application ID from `/auth/v1` identifies
+DTLS and `active_streamer`. START refuses another owner, and STOP checks that the stream is
+ours. Hue offers no conditional ownership mutation, so the check and STOP cannot be atomic
+against another app. Do not use automatic stop/start to force a takeover.
+
+A dedicated output worker repeats the latest packet at 50 Hz, independently of capture FPS.
+Adaptive deadband suppresses new colour-update submissions; it does not currently reduce
+capture or sampling work. Repeats do not resample colours. Pause, layout invalidation and
+shutdown drop this worker before releasing the session. `light_update_fps` measures submitted
+colour updates, not the cached packet repetition rate or physical lamp updates.
 Nanoleaf pairing limits each HTTP request to three seconds or the remaining pairing budget,
 whichever is shorter, including response bodies and the subsequent panel-layout request.
 
@@ -82,7 +95,7 @@ Hue v2 may group several physical gradient segments into one Entertainment chann
 - Preset automation uses the same unauthenticated LAN API as the dashboard; do not expose port 8088 to the Internet.
 - Pairing requires physical access to the Bridge or controller.
 - `config.json` contains secrets and must be mode `0600` on the TV.
-- Hue v2 HTTPS uses the fingerprint captured during push-link pairing; never disable verification globally.
+- Hue HTTPS trusts only the two official Hue root CAs and checks the certificate CN against the saved Bridge ID before sending credentials. An existing leaf pin must match exactly to bootstrap a missing Bridge ID. Signed renewal is accepted only for that saved identity; changed identities require explicit pairing. No plaintext fallback is permitted.
 - Never log credentials, tokens, certificate pins, or complete configuration payloads.
 
 ## Native API references
@@ -115,3 +128,12 @@ Colour investigation order:
 4. Trial float colour storage through sampling and smoothing only if captured data or output shows quantization, banding, or slow-fade instability. Compare output bytes, Hue/Nanoleaf appearance, and ARMv7 CPU use before adopting it.
 
 Keep device-specific geometry and protocols. HyperHDR's USB grabber and direct RGBW dithering do not solve a demonstrated problem in this rooted-TV and controller setup.
+
+## Hue reference review (2026-10-22)
+
+- [Streaming guide](https://developers.meethue.com/develop/hue-entertainment/hue-entertainment-api/): 50–60 Hz is a packet-loss resilience recommendation; ten seconds of inactivity closes the stream. It is not a 60 Hz physical-light update guarantee.
+- [Core concepts](https://developers.meethue.com/develop/hue-api-v2/core-concepts/#representations): resource representations can lag hardware; REST state and successful UDP writes do not prove physical light output. SSE events are partial changes and can coalesce within one second.
+- [HTTPS](https://developers.meethue.com/develop/application-design-guidance/using-https/): both Hue root CAs, certificate chain verification and Bridge ID verification are required; no HTTP fallback.
+- [Colour conversion](https://developers.meethue.com/develop/application-design-guidance/color-conversion-formulas-rgb-to-xy-and-back/): decode sRGB, convert to XYZ/xy, derive brightness from Y, and clip against the light's reported gamut. The page's prose matrix and legacy SDK extract differ. This change retains the existing Hue-specific matrix and Gamut C output option; it does not claim per-light gamut discovery or calibrated display matching.
+- [Discovery](https://developers.meethue.com/develop/application-design-guidance/hue-bridge-discovery/): local mDNS first, cloud fallback limited to one attempt per fifteen minutes per process, manual IP on ambiguity. Paired address recovery selects only the saved Bridge ID after TCP connection failure; TLS/authorization errors never trigger a different bridge selection. Separate short-lived CLI processes do not share the cloud cache.
+- [Bridge Pro migration](https://developers.meethue.com/multi-bridge-migration-support-is-live/): replacement credentials may require re-pairing, and migrated resource IDs may require explicit area selection. No name-based automatic remapping.

@@ -24,28 +24,19 @@ pub(crate) async fn run_pair(bridge_opt: Option<String>, output: PathBuf) -> Res
         },
     };
 
-    let (username, clientkey, area) = hue::pair_bridge(&bridge_ip, 45)?;
+    let paired = hue::pair_bridge(&bridge_ip, 45)?;
+    let needs_area = paired.area.is_none();
     Config::update(
         &output,
-        Some(Config::new_default(
-            &bridge_ip,
-            &username,
-            &clientkey,
-            &area.configuration_id,
-        )),
+        Some(Config::new_default("", "", "", "")),
         |config| {
-            config.bridge_ip = bridge_ip;
-            config.username = username;
-            config.clientkey = clientkey;
-            config.entertainment_area_id = area.configuration_id.clone();
-            config.entertainment_configuration_id = Some(area.configuration_id);
-            config.hue_bridge_certificate_sha256 = Some(area.certificate_sha256);
-            if !area.zones.is_empty() {
-                config.zones = area.zones;
-            }
+            config.apply_hue_pairing(bridge_ip, paired);
             Ok(())
         },
     )?;
+    if needs_area {
+        println!("Hue paired. Select an Entertainment Area in the dashboard or run sync-hue --area <name-or-id> before starting Hue output.");
+    }
     println!(
         "\n[+] Configuration and Hue credentials successfully saved to {:?}",
         output
@@ -60,6 +51,7 @@ pub(crate) async fn run_sync_hue(config_path: PathBuf, target_area: Option<Strin
         config.bridge_ip.clone(),
         config.username.clone(),
         config.hue_bridge_certificate_sha256.clone(),
+        config.hue_bridge_id.clone(),
     );
     info!(
         "Querying Hue Bridge at {} for Entertainment Areas...",
@@ -70,7 +62,7 @@ pub(crate) async fn run_sync_hue(config_path: PathBuf, target_area: Option<Strin
         &config.bridge_ip,
         &config.username,
         target_area.as_deref(),
-        config.hue_bridge_certificate_sha256.as_deref(),
+        config.hue_trust(),
     )?;
 
     config = Config::update(&config_path, None, |config| {
@@ -78,15 +70,18 @@ pub(crate) async fn run_sync_hue(config_path: PathBuf, target_area: Option<Strin
             config.bridge_ip.as_str(),
             config.username.as_str(),
             config.hue_bridge_certificate_sha256.as_ref(),
+            config.hue_bridge_id.as_ref(),
         ) != (
             bridge_identity.0.as_str(),
             bridge_identity.1.as_str(),
             bridge_identity.2.as_ref(),
+            bridge_identity.3.as_ref(),
         ) {
             anyhow::bail!("Hue Bridge configuration changed during sync; retry");
         }
         config.entertainment_area_id = area.configuration_id.clone();
         config.entertainment_configuration_id = Some(area.configuration_id);
+        config.hue_bridge_id = Some(area.bridge_id.clone());
         config.hue_bridge_certificate_sha256 = Some(area.certificate_sha256);
         if !area.zones.is_empty() {
             config.zones = area.zones;

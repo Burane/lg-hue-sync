@@ -78,6 +78,11 @@ cargo run -- run --config config.json
 
 Pairing and patterns affect physical devices. Use them only when the owner expects light output.
 
+`uv run scripts/pair_hue.py --bridge-ip <bridge-ip> --output-config config.json`
+remains a deprecated compatibility wrapper for Rust HTTPS pairing. It builds for
+the Rust compiler's host target, preserves the existing argument names, and no
+longer accepts `--tv-ip` or configures Hyperion directly.
+
 For screen-to-light mapping checks, display the [4K calibration images or selectable browser patches](calibration-patterns/README.md) through the viewing HDMI source. Unlike the dashboard's direct light tests, these exercise capture and video-derived sampling.
 
 ## Configuration
@@ -88,7 +93,7 @@ Start from [config.example.json](config.example.json), or pair through the dashb
 /var/home/root/lg-hue-sync/config.json
 ```
 
-Hue v2 HTTPS calls use a scoped SHA-256 certificate pin established during physical push-link pairing. Status endpoints never return Hue or Nanoleaf secrets.
+Hue HTTPS validates the two official Hue root CAs and the saved Bridge ID. Existing certificate pins bootstrap that identity only on an exact match; subsequent signed certificate renewal retains the identity check. Pairing never falls back to HTTP. Status endpoints never return Hue or Nanoleaf secrets.
 
 ## Project layout
 

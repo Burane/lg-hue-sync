@@ -1,21 +1,23 @@
+pub mod discovery;
 pub mod dtls;
+pub mod events;
+pub mod output;
 pub mod reconnect;
 pub mod stream;
+pub mod tls;
 
 use anyhow::{anyhow, Context, Result};
-use openssl::hash::MessageDigest;
-use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use serde_json::Value;
-use std::fmt::Write as _;
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, TcpStream};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
-use tracing::info;
 
+pub use discovery::discover_bridge;
 pub use dtls::HueDtlsClient;
 pub use stream::HueStreamPacketBuilder;
+pub use tls::{connect_bridge_tls, peer_bridge_id, BridgeTrust};
 
 #[derive(Debug, Clone)]
 pub struct EntertainmentArea {
@@ -23,6 +25,7 @@ pub struct EntertainmentArea {
     pub configuration_id: String,
     pub zones: Vec<crate::config::LightZone>,
     pub certificate_sha256: String,
+    pub bridge_id: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -31,106 +34,105 @@ pub struct EntertainmentAreaSummary {
     pub name: String,
 }
 
-/// Auto-discovers Hue Bridge on LAN via official discovery service
-pub fn discover_bridge() -> Result<String> {
-    info!("Searching for Hue Bridge via discovery.meethue.com...");
-    let resp = ureq::get("https://discovery.meethue.com/")
-        .header("User-Agent", "lg-hue-sync/0.1.0")
-        .call()
-        .context("Failed to query Hue discovery API")?;
-
-    let json: Value = resp
-        .into_body()
-        .read_json()
-        .context("Failed to parse discovery JSON")?;
-    if let Some(arr) = json.as_array() {
-        if let Some(first) = arr.first() {
-            if let Some(ip) = first.get("internalipaddress").and_then(|v| v.as_str()) {
-                info!("Found Hue Bridge at {}", ip);
-                return Ok(ip.to_string());
-            }
-        }
-    }
-    Err(anyhow!(
-        "No Hue Bridge detected on network via discovery API"
-    ))
+pub struct PairedBridge {
+    pub username: String,
+    pub clientkey: String,
+    pub area: Option<EntertainmentArea>,
+    pub bridge_id: String,
+    pub certificate_sha256: String,
 }
 
-/// Polls the bridge for pushlink button press and authenticates
-pub fn pair_bridge(
-    bridge_ip: &str,
-    timeout_secs: u64,
-) -> Result<(String, String, EntertainmentArea)> {
-    let url = format!("http://{}/api", bridge_ip);
-    let payload = serde_json::json!({
-        "devicetype": "lg-hue-sync#tv",
-        "generateclientkey": true
-    });
-
-    println!("\n========================================================");
-    println!(">>> ACTION REQUIRED:");
-    println!(">>> Press the big round button on your Philips Hue Bridge!");
-    println!("========================================================\n");
-
+/// Pair over CA-verified HTTPS after validating the bridge identity, never falling back to HTTP.
+pub fn pair_bridge(bridge_ip: &str, timeout_secs: u64) -> Result<PairedBridge> {
+    let identity = raw_request(
+        bridge_ip,
+        "",
+        "GET",
+        "/api/0/config",
+        None,
+        BridgeTrust::default(),
+    )?;
+    let config: Value = serde_json::from_slice(&identity.body)?;
+    if !config
+        .get("bridgeid")
+        .and_then(Value::as_str)
+        .is_some_and(|id| id.eq_ignore_ascii_case(&identity.bridge_id))
+    {
+        return Err(anyhow!(
+            "Hue Bridge configuration and certificate identities do not match"
+        ));
+    }
+    let trust = BridgeTrust {
+        bridge_id: Some(&identity.bridge_id),
+        certificate_sha256: None,
+    };
+    let payload = serde_json::json!({ "devicetype": "lg-hue-sync#tv", "generateclientkey": true });
+    println!("Press the round button on your Philips Hue Bridge to pair.");
     let start = Instant::now();
-    let mut username = String::new();
-    let mut clientkey = String::new();
-    let agent = crate::local_http::agent(None);
-
     while start.elapsed() < Duration::from_secs(timeout_secs) {
-        let resp = agent
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .send_json(payload.clone());
-
-        if let Ok(r) = resp {
-            if let Ok(Value::Array(items)) = r.into_body().read_json::<Value>() {
-                if let Some(first) = items.first() {
-                    if let Some(success) = first.get("success") {
-                        username = success
-                            .get("username")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        clientkey = success
-                            .get("clientkey")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        println!("\n[+] Successfully paired with Hue Bridge!");
-                        break;
-                    } else if let Some(err) = first.get("error") {
-                        if err.get("type").and_then(|v| v.as_i64()) == Some(101) {
-                            print!(".");
-                            use std::io::Write;
-                            std::io::stdout().flush().ok();
-                        }
-                    }
+        let (response, _) = v2_request(bridge_ip, "", "POST", "/api", Some(&payload), trust)?;
+        if let Some(success) = response
+            .as_array()
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("success"))
+        {
+            let username = success
+                .get("username")
+                .and_then(Value::as_str)
+                .filter(|key| !key.is_empty())
+                .ok_or_else(|| anyhow!("Hue pairing returned no application key"))?;
+            let clientkey = success
+                .get("clientkey")
+                .and_then(Value::as_str)
+                .filter(|key| key.len() == 32 && key.bytes().all(|b| b.is_ascii_hexdigit()))
+                .ok_or_else(|| anyhow!("Hue pairing returned an invalid client key"))?;
+            // The client key is returned only once; layout discovery must not discard it.
+            let area = match sync_entertainment_areas(bridge_ip, username, None, trust) {
+                Ok(area) => Some(area),
+                Err(_) => {
+                    tracing::warn!("Hue paired; Entertainment area selection is required when the bridge is reachable");
+                    None
                 }
-            }
+            };
+            return Ok(PairedBridge {
+                username: username.to_owned(),
+                clientkey: clientkey.to_owned(),
+                area,
+                bridge_id: identity.bridge_id,
+                certificate_sha256: identity.certificate_sha256,
+            });
         }
-        std::thread::sleep(Duration::from_secs(1));
+        if response.pointer("/0/error/type").and_then(Value::as_i64) != Some(101) {
+            return Err(anyhow!("Hue Bridge rejected pairing"));
+        }
+        thread::sleep(Duration::from_secs(1));
     }
-
-    if username.is_empty() || clientkey.is_empty() {
-        return Err(anyhow!("Timed out waiting for Hue Bridge button press"));
-    }
-
-    let area = sync_entertainment_areas(bridge_ip, &username, None, None)?;
-
-    Ok((username, clientkey, area))
+    Err(anyhow!("Timed out waiting for Hue Bridge button press"))
 }
 
 /// Queries the Hue Bridge for Entertainment Areas and translates 3D light coordinates into screen sampling zones.
-/// If `target_area` is specified, selects by ID or name; otherwise defaults to the first configured area.
+/// If `target_area` is specified, selects by ID or name; otherwise requires exactly one area.
 pub fn sync_entertainment_areas(
     bridge_ip: &str,
     username: &str,
     target_area: Option<&str>,
-    expected_certificate_sha256: Option<&str>,
+    trust: BridgeTrust<'_>,
 ) -> Result<EntertainmentArea> {
-    let (configurations, certificate_sha256) =
-        fetch_v2_configurations(bridge_ip, username, expected_certificate_sha256)?;
+    let response = raw_request(
+        bridge_ip,
+        username,
+        "GET",
+        "/clip/v2/resource/entertainment_configuration",
+        None,
+        trust,
+    )?;
+    let configurations: Value = serde_json::from_slice(&response.body)?;
+    let certificate_sha256 = response.certificate_sha256;
+    let bridge_id = response.bridge_id;
+    let trust = BridgeTrust {
+        bridge_id: Some(&bridge_id),
+        certificate_sha256: None,
+    };
     let configuration_data = configurations
         .get("data")
         .and_then(Value::as_array)
@@ -139,21 +141,16 @@ pub fn sync_entertainment_areas(
     let configuration_id = configuration
         .get("id")
         .and_then(Value::as_str)
-        .filter(|id| id.len() == 36)
+        .filter(|id| valid_configuration_id(id))
         .ok_or_else(|| anyhow!("Hue v2 configuration '{}' has no UUID", area_name))?
         .to_string();
     let (entertainment_services, _) = fetch_v2_resource(
         bridge_ip,
         username,
         "/clip/v2/resource/entertainment",
-        Some(&certificate_sha256),
+        trust,
     )?;
-    let (devices, _) = fetch_v2_resource(
-        bridge_ip,
-        username,
-        "/clip/v2/resource/device",
-        Some(&certificate_sha256),
-    )?;
+    let (devices, _) = fetch_v2_resource(bridge_ip, username, "/clip/v2/resource/device", trust)?;
     let discovered_zones = zones_from_v2_configuration(
         configuration,
         entertainment_services.get("data").and_then(Value::as_array),
@@ -170,6 +167,7 @@ pub fn sync_entertainment_areas(
         configuration_id,
         zones: discovered_zones,
         certificate_sha256,
+        bridge_id,
     })
 }
 
@@ -178,10 +176,9 @@ pub fn sync_entertainment_areas(
 pub fn list_entertainment_areas(
     bridge_ip: &str,
     username: &str,
-    expected_certificate_sha256: Option<&str>,
+    trust: BridgeTrust<'_>,
 ) -> Result<Vec<EntertainmentAreaSummary>> {
-    let (configurations, _) =
-        fetch_v2_configurations(bridge_ip, username, expected_certificate_sha256)?;
+    let (configurations, _) = fetch_v2_configurations(bridge_ip, username, trust)?;
     let data = configurations
         .get("data")
         .and_then(Value::as_array)
@@ -202,18 +199,17 @@ pub fn list_entertainment_areas(
     Ok(areas)
 }
 
-/// Fetches V2 configurations through a bridge-specific certificate pin.
-/// Pairing accepts the first certificate only after the user proves physical access via pushlink.
+/// Fetches V2 configurations through the verified bridge identity.
 fn fetch_v2_configurations(
     bridge_ip: &str,
     username: &str,
-    expected_certificate_sha256: Option<&str>,
+    trust: BridgeTrust<'_>,
 ) -> Result<(Value, String)> {
     fetch_v2_resource(
         bridge_ip,
         username,
         "/clip/v2/resource/entertainment_configuration",
-        expected_certificate_sha256,
+        trust,
     )
 }
 
@@ -221,16 +217,9 @@ fn fetch_v2_resource(
     bridge_ip: &str,
     username: &str,
     path: &str,
-    expected_certificate_sha256: Option<&str>,
+    trust: BridgeTrust<'_>,
 ) -> Result<(Value, String)> {
-    v2_request(
-        bridge_ip,
-        username,
-        "GET",
-        path,
-        None,
-        expected_certificate_sha256,
-    )
+    v2_request(bridge_ip, username, "GET", path, None, trust)
 }
 
 fn v2_request(
@@ -239,48 +228,60 @@ fn v2_request(
     method: &str,
     path: &str,
     payload: Option<&Value>,
-    expected_certificate_sha256: Option<&str>,
+    trust: BridgeTrust<'_>,
 ) -> Result<(Value, String)> {
-    let address = format!("{}:443", bridge_ip)
-        .to_socket_addrs()
-        .context("Failed to resolve Hue Bridge address")?
-        .next()
-        .ok_or_else(|| anyhow!("Hue Bridge address did not resolve"))?;
-    let tcp = TcpStream::connect_timeout(&address, Duration::from_secs(5))
-        .context("Failed to connect to Hue Bridge HTTPS endpoint")?;
-    tcp.set_read_timeout(Some(Duration::from_secs(5)))?;
-    tcp.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let _deadline_guard = SocketDeadline::new(&tcp, deadline)?;
-    let mut builder = SslConnector::builder(SslMethod::tls())?;
-    // The local bridge presents a self-signed certificate. Verification below pins its SHA-256 DER fingerprint.
-    builder.set_verify(SslVerifyMode::NONE);
-    let connector = builder.build();
-    let mut stream = connector
-        .connect(bridge_ip, tcp)
-        .context("Hue Bridge TLS handshake failed")?;
-    let certificate = stream
-        .ssl()
-        .peer_certificate()
-        .ok_or_else(|| anyhow!("Hue Bridge did not present a TLS certificate"))?;
-    let digest = certificate.digest(MessageDigest::sha256())?;
-    let mut certificate_sha256 = String::with_capacity(digest.len() * 2);
-    for byte in digest.as_ref() {
-        write!(&mut certificate_sha256, "{byte:02x}")?;
+    let response = raw_request(bridge_ip, username, method, path, payload, trust)?;
+    let json: Value = serde_json::from_slice(&response.body)?;
+    if json
+        .get("errors")
+        .and_then(Value::as_array)
+        .is_some_and(|errors| !errors.is_empty())
+    {
+        return Err(anyhow!("Hue Bridge rejected the API request"));
     }
-    if let Some(expected) = expected_certificate_sha256 {
-        if !expected.eq_ignore_ascii_case(&certificate_sha256) {
-            return Err(anyhow!(
-                "Hue Bridge certificate fingerprint changed; refusing V2 request"
-            ));
-        }
-    }
+    Ok((json, response.certificate_sha256))
+}
 
+struct HttpResponse {
+    headers: String,
+    body: Vec<u8>,
+    certificate_sha256: String,
+    bridge_id: String,
+}
+
+fn raw_request(
+    bridge_ip: &str,
+    username: &str,
+    method: &str,
+    path: &str,
+    payload: Option<&Value>,
+    trust: BridgeTrust<'_>,
+) -> Result<HttpResponse> {
+    if !username.is_empty() && !trust.known() {
+        return Err(anyhow!(
+            "Hue Bridge has no saved identity; pair it explicitly before sending credentials"
+        ));
+    }
+    if (!username.is_empty() && !valid_application_key(username))
+        || !path.starts_with('/')
+        || !path.bytes().all(|b| b.is_ascii_graphic())
+        || !matches!(method, "GET" | "POST" | "PUT")
+    {
+        return Err(anyhow!("Invalid Hue HTTP request parameters"));
+    }
+    let mut stream = connect_bridge_tls(bridge_ip, trust)?;
+    let certificate_sha256 = tls::peer_certificate_sha256(&stream)?;
+    let bridge_id = peer_bridge_id(&stream)?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let _deadline_guard = SocketDeadline::new(stream.get_ref(), deadline)?;
     let body = payload.map(serde_json::to_vec).transpose()?;
     write!(
         stream,
-        "{method} {path} HTTP/1.1\r\nHost: {bridge_ip}\r\nhue-application-key: {username}\r\nConnection: close\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {bridge_ip}\r\nConnection: close\r\n"
     )?;
+    if !username.is_empty() {
+        write!(stream, "hue-application-key: {username}\r\n")?;
+    }
     if let Some(body) = &body {
         write!(
             stream,
@@ -310,14 +311,71 @@ fn v2_request(
         .nth(1)
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or_default();
-    if !(200..300).contains(&status) {
-        return Err(anyhow!(
-            "Hue Bridge V2 request failed: {}",
-            headers.lines().next().unwrap_or("unknown status")
-        ));
-    }
+    check_status(status)?;
     let body = decode_http_body(headers, &response[header_end + 4..])?;
-    Ok((serde_json::from_slice(&body)?, certificate_sha256))
+    Ok(HttpResponse {
+        headers: headers.to_owned(),
+        body,
+        certificate_sha256,
+        bridge_id,
+    })
+}
+
+fn check_status(status: u16) -> Result<()> {
+    match status {
+        200..=299 => Ok(()),
+        401 | 403 => {
+            Err(events::SessionInvalid("Hue authorization rejected; re-pair the bridge").into())
+        }
+        404 => Err(events::SessionInvalid(
+            "Hue resource no longer exists; reselect the Entertainment area after migration",
+        )
+        .into()),
+        429 | 503 => Err(anyhow!("Hue Bridge is busy ({status}); retry with backoff")),
+        _ => Err(anyhow!(
+            "Hue Bridge HTTPS request failed with status {status}"
+        )),
+    }
+}
+
+/// The application ID is a response header, not the application key and not a JSON body field.
+pub fn fetch_application_id(
+    bridge_ip: &str,
+    username: &str,
+    trust: BridgeTrust<'_>,
+) -> Result<String> {
+    let response = raw_request(bridge_ip, username, "GET", "/auth/v1", None, trust)?;
+    application_id_header(&response.headers)
+}
+
+fn application_id_header(headers: &str) -> Result<String> {
+    let ids = headers
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.eq_ignore_ascii_case("hue-application-id"))
+        .map(|(_, value)| value.trim())
+        .collect::<Vec<_>>();
+    match ids.as_slice() {
+        [id] if valid_configuration_id(id) => Ok(id.to_ascii_lowercase()),
+        _ => Err(anyhow!(
+            "Hue authentication response has no valid application ID"
+        )),
+    }
+}
+
+pub fn valid_configuration_id(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+pub fn valid_application_key(key: &str) -> bool {
+    !key.is_empty() && key.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
 struct SocketDeadline {
@@ -660,87 +718,206 @@ mod selection_tests {
     }
 }
 
-/// Activates or deactivates the V2 Entertainment configuration through the pinned bridge API.
+/// Changes only our own stream; another application's stream is never stopped or taken over.
 pub fn set_stream_active(
     bridge_ip: &str,
     username: &str,
     configuration_id: &str,
-    expected_certificate_sha256: Option<&str>,
+    trust: BridgeTrust<'_>,
     active: bool,
 ) -> Result<()> {
-    info!(
-        "Sending V2 stream {} request to Hue Bridge...",
-        if active { "START" } else { "STOP" },
-    );
+    let state = get_stream_state(bridge_ip, username, configuration_id, trust)?;
+    if !stream_action_needed(&state, active)? {
+        return Ok(());
+    }
     let path = format!("/clip/v2/resource/entertainment_configuration/{configuration_id}");
-    let (response, _) = v2_request(
+    let _ = v2_request(
         bridge_ip,
         username,
         "PUT",
         &path,
         Some(&serde_json::json!({ "action": if active { "start" } else { "stop" } })),
-        expected_certificate_sha256,
+        trust,
     )?;
-    if response
-        .get("errors")
-        .and_then(Value::as_array)
-        .is_some_and(|errors| !errors.is_empty())
-    {
-        return Err(anyhow!("Hue Bridge rejected V2 stream action"));
+    if active && !get_stream_state(bridge_ip, username, configuration_id, trust)?.active {
+        return Err(anyhow!(
+            "Hue did not grant stream ownership to this application"
+        ));
     }
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+fn stream_action_needed(state: &StreamState, active: bool) -> Result<bool> {
+    if state.busy && active {
+        return Err(anyhow!(
+            "Hue Entertainment area is in use by another application"
+        ));
+    }
+    Ok(!state.busy && state.active != active)
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct StreamState {
+    /// Active only when the bridge identifies this application as the streamer.
     pub active: bool,
-    /// 0.0 to 1.0 (if reported by bridge, default 1.0)
+    pub busy: bool,
+    pub application_id: String,
+    pub active_streamer: Option<String>,
     pub brightness: f32,
-    /// Suggested smoothing factor: 0.15 (subtle) to 0.85 (extreme)
     pub smoothing_factor: f32,
 }
 
-/// Queries the V2 configuration state. Hue does not expose a stream brightness or smoothing value.
-pub fn get_stream_state(
-    bridge_ip: &str,
-    username: &str,
-    configuration_id: &str,
-    expected_certificate_sha256: Option<&str>,
-) -> Result<StreamState> {
-    let path = format!("/clip/v2/resource/entertainment_configuration/{configuration_id}");
-    let (json, _) = fetch_v2_resource(bridge_ip, username, &path, expected_certificate_sha256)?;
-    let configuration = json
-        .get("data")
-        .and_then(Value::as_array)
-        .and_then(|items| items.first())
-        .ok_or_else(|| anyhow!("Hue V2 configuration response has no data"))?;
+pub fn parse_stream_state(configuration: &Value, application_id: &str) -> Result<StreamState> {
+    if !valid_configuration_id(application_id) {
+        return Err(anyhow!("Invalid Hue application ID"));
+    }
+    let streaming = match configuration.get("status").and_then(Value::as_str) {
+        Some("active") => true,
+        Some("inactive") => false,
+        _ => {
+            return Err(anyhow!(
+                "Hue Entertainment configuration has no valid status"
+            ))
+        }
+    };
+    let active_streamer = streaming
+        .then(|| {
+            configuration
+                .pointer("/active_streamer/rid")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .flatten();
+    let ours = active_streamer
+        .as_ref()
+        .is_some_and(|id| id.eq_ignore_ascii_case(application_id))
+        && configuration
+            .pointer("/active_streamer/rtype")
+            .and_then(Value::as_str)
+            == Some("auth_v1");
     Ok(StreamState {
-        active: configuration.get("status").and_then(Value::as_str) == Some("active"),
+        active: streaming && ours,
+        busy: streaming && !ours,
+        application_id: application_id.to_owned(),
+        active_streamer,
         brightness: 1.0,
         smoothing_factor: 0.35,
     })
 }
 
-/// Queries whether the entertainment area is currently active on the Hue Bridge
+pub fn fetch_stream_configuration(
+    bridge_ip: &str,
+    username: &str,
+    configuration_id: &str,
+    trust: BridgeTrust<'_>,
+) -> Result<Value> {
+    if !valid_configuration_id(configuration_id) {
+        return Err(anyhow!("Invalid Hue Entertainment configuration UUID"));
+    }
+    let path = format!("/clip/v2/resource/entertainment_configuration/{configuration_id}");
+    let (json, _) = fetch_v2_resource(bridge_ip, username, &path, trust)?;
+    json.get("data")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("id").and_then(Value::as_str) == Some(configuration_id))
+        })
+        .cloned()
+        .ok_or_else(|| anyhow!("Hue V2 configuration response has no selected area"))
+}
+
+pub fn get_stream_state(
+    bridge_ip: &str,
+    username: &str,
+    configuration_id: &str,
+    trust: BridgeTrust<'_>,
+) -> Result<StreamState> {
+    let application_id = fetch_application_id(bridge_ip, username, trust)?;
+    let configuration = fetch_stream_configuration(bridge_ip, username, configuration_id, trust)?;
+    parse_stream_state(&configuration, &application_id)
+}
+
 #[allow(dead_code)]
 pub fn get_stream_status(
     bridge_ip: &str,
     username: &str,
     configuration_id: &str,
-    expected_certificate_sha256: Option<&str>,
+    trust: BridgeTrust<'_>,
 ) -> Result<bool> {
-    get_stream_state(
-        bridge_ip,
-        username,
-        configuration_id,
-        expected_certificate_sha256,
-    )
-    .map(|s| s.active)
+    get_stream_state(bridge_ip, username, configuration_id, trust).map(|s| s.active)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ownership_never_treats_another_or_unknown_streamer_as_ours() {
+        let app = "12345678-1234-1234-1234-123456789abc";
+        let other = "12345678-1234-1234-1234-123456789abd";
+        let config = serde_json::json!({"status":"active", "active_streamer":{"rtype":"auth_v1", "rid":app}});
+        let state = parse_stream_state(&config, app).unwrap();
+        assert!(state.active && !state.busy);
+        assert!(!stream_action_needed(&state, true).unwrap());
+        assert!(stream_action_needed(&state, false).unwrap());
+        let state = parse_stream_state(&config, other).unwrap();
+        assert!(!state.active && state.busy);
+        assert!(stream_action_needed(&state, true).is_err());
+        assert!(!stream_action_needed(&state, false).unwrap());
+        let state = parse_stream_state(&serde_json::json!({"status":"active"}), app).unwrap();
+        assert!(!state.active && state.busy);
+        let state = parse_stream_state(&serde_json::json!({"status":"inactive", "active_streamer":{"rtype":"auth_v1", "rid":other}}), app).unwrap();
+        assert!(!state.active && !state.busy && state.active_streamer.is_none());
+        assert!(stream_action_needed(&state, true).unwrap());
+        assert!(!stream_action_needed(&state, false).unwrap());
+        assert!(parse_stream_state(&serde_json::json!({}), app).is_err());
+        assert!(valid_configuration_id(app));
+        assert!(!valid_configuration_id(
+            "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+        ));
+        assert!(!valid_configuration_id(
+            "1234567811234-1234-1234-123456789abc"
+        ));
+    }
+
+    #[test]
+    fn authentication_headers_and_http_failures_are_unambiguous() {
+        let app = "12345678-1234-1234-1234-123456789abc";
+        assert_eq!(
+            application_id_header(&format!("HTTP/1.1 200 OK\r\nHue-Application-Id: {app}\r\n"))
+                .unwrap(),
+            app
+        );
+        assert!(application_id_header("HTTP/1.1 200 OK\r\n").is_err());
+        assert!(application_id_header("hue-application-id: bad").is_err());
+        assert!(application_id_header(&format!(
+            "hue-application-id: {app}\r\nhue-application-id: {app}"
+        ))
+        .is_err());
+        assert!(valid_application_key("opaque-key-123"));
+        for key in ["", "key\r\ninjected: true", "key\0", "key with spaces"] {
+            assert!(!valid_application_key(key));
+        }
+        assert!(check_status(204).is_ok());
+        for status in [401, 403, 404] {
+            assert!(check_status(status)
+                .unwrap_err()
+                .is::<events::SessionInvalid>());
+        }
+        assert!(check_status(401)
+            .unwrap_err()
+            .to_string()
+            .contains("re-pair"));
+        assert!(check_status(404)
+            .unwrap_err()
+            .to_string()
+            .contains("reselect"));
+        assert!(check_status(429)
+            .unwrap_err()
+            .to_string()
+            .contains("backoff"));
+    }
 
     #[test]
     fn v2_channels_keep_explicit_channel_ids() {

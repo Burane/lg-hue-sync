@@ -25,6 +25,7 @@ Read `AGENTS.md`, then the relevant guide:
 - Verify local/remote SHA-256, service state, and dashboard response after transfer.
 - Verify physical output before claiming capture-to-light success.
 - Preserve Hue v2 channel IDs and grouped gradient member identity.
+- Use CA-verified HTTPS, saved Bridge ID and `/auth/v1` application identity; see `docs/architecture.md` for legacy-pin migration and ownership rules. Do not resume cached Hue output after known deletion, revoked access or a failed layout refresh. Verify recovery on the TV before claiming it works live.
 - Work directly on `main`; no branch or PR unless explicitly requested.
 
 Use repository scripts and Make targets. If a script would overwrite configuration or broaden device mutation, fix the script instead of issuing an ad-hoc destructive command.

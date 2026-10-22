@@ -166,6 +166,9 @@ pub struct Config {
     pub bridge_ip: String,
     pub username: String,
     pub clientkey: String,
+    /// Stable identity checked against the Hue-signed certificate, independent of IP/renewal.
+    #[serde(default)]
+    pub hue_bridge_id: Option<String>,
     /// SHA-256 fingerprint of the bridge's local V2 HTTPS certificate.
     #[serde(default)]
     pub hue_bridge_certificate_sha256: Option<String>,
@@ -331,6 +334,32 @@ fn default_zones() -> Vec<LightZone> {
 }
 
 impl Config {
+    pub fn apply_hue_pairing(&mut self, bridge_ip: String, paired: crate::hue::PairedBridge) {
+        self.bridge_ip = bridge_ip;
+        self.username = paired.username;
+        self.clientkey = paired.clientkey;
+        self.hue_bridge_id = Some(paired.bridge_id);
+        self.hue_bridge_certificate_sha256 = Some(paired.certificate_sha256);
+        self.hue_enabled = true;
+        self.hue_sync_enabled = true;
+        self.entertainment_configuration_id = paired
+            .area
+            .as_ref()
+            .map(|area| area.configuration_id.clone());
+        self.entertainment_area_id = self
+            .entertainment_configuration_id
+            .clone()
+            .unwrap_or_default();
+        self.zones = paired.area.map(|area| area.zones).unwrap_or_default();
+    }
+
+    pub fn hue_trust(&self) -> crate::hue::BridgeTrust<'_> {
+        crate::hue::BridgeTrust {
+            bridge_id: self.hue_bridge_id.as_deref(),
+            certificate_sha256: self.hue_bridge_certificate_sha256.as_deref(),
+        }
+    }
+
     fn validate_capture_dimensions(&self, path: &Path) -> Result<(), ConfigError> {
         // Bounds both native capture requests and MockCapture's u32 RGBA allocation math.
         if self.capture_width == 0
@@ -355,6 +384,7 @@ impl Config {
             bridge_ip: bridge_ip.to_string(),
             username: username.to_string(),
             clientkey: clientkey.to_string(),
+            hue_bridge_id: None,
             hue_bridge_certificate_sha256: None,
             entertainment_area_id: area_id.to_string(),
             entertainment_configuration_id: None,
@@ -518,6 +548,25 @@ fn lock_config(path: &Path) -> Result<File, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pairing_without_an_area_keeps_credentials_but_clears_old_mapping() {
+        let mut config = Config::new_default("old", "old", "old", "old-area");
+        let paired = crate::hue::PairedBridge {
+            username: "test-application-key".into(),
+            clientkey: "00".repeat(16),
+            area: None,
+            bridge_id: "001788fffe000001".into(),
+            certificate_sha256: "aa".repeat(32),
+        };
+        config.apply_hue_pairing("192.0.2.1".into(), paired);
+        assert_eq!(config.username, "test-application-key");
+        assert_eq!(config.clientkey, "00".repeat(16));
+        assert_eq!(config.hue_bridge_id.as_deref(), Some("001788fffe000001"));
+        assert!(config.hue_enabled && config.hue_sync_enabled);
+        assert!(config.entertainment_configuration_id.is_none());
+        assert!(config.entertainment_area_id.is_empty() && config.zones.is_empty());
+    }
 
     #[test]
     fn new_configs_disable_unverified_hdr_curve_without_changing_legacy_missing_field() {

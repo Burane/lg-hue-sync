@@ -16,6 +16,8 @@ config.json
 *.json.lock
 .env
 *.pem
+# Public Hue trust anchors are source inputs, not device credentials.
+!src/hue/bridge-ca.pem
 *.key
 
 # webOS packages & temp assets

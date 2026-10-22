@@ -29,6 +29,7 @@ sd-notify = "0.5"
 libc = "0.2"
 palette = { version = "0.7.7", default-features = false, features = ["std"] }
 yuv = { version = "0.8.19", default-features = false, features = ["professional_mode"] }
+mdns-sd = { version = "0.21.6", default-features = false }
 
 [profile.release]
 opt-level = 3
