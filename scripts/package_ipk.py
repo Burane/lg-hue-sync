@@ -1,118 +1,78 @@
 #!/usr/bin/env python3
-"""
-Package the webOS application directory into an installable .ipk (ar archive).
-"""
+"""Package the launcher with Rust Ares and retain its Homebrew manifest."""
+import argparse
 import hashlib
-import io
 import json
 import os
-import tarfile
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 APP_DIR = ROOT_DIR / "webos-app"
-APP_INFO = json.loads((APP_DIR / "appinfo.json").read_text(encoding="utf-8"))
-VERSION = APP_INFO["version"]
-OUTPUT_IPK = ROOT_DIR / "target" / f"org.webosbrew.lg-hue-sync_{VERSION}_all.ipk"
-OUTPUT_MANIFEST = ROOT_DIR / "target" / "org.webosbrew.lg-hue-sync.manifest.json"
+OUTPUT_DIR = ROOT_DIR / "target"
 
-def make_tarfile_bytes(files_dict):
-    """Create a tar.gz in memory from a dict of {arcname: (bytes, mode)}"""
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        for arcname, (data, mode) in files_dict.items():
-            info = tarfile.TarInfo(name=arcname)
-            info.size = len(data)
-            info.mode = mode
-            info.uid = 0
-            info.gid = 0
-            info.uname = "root"
-            info.gname = "root"
-            tar.addfile(info, io.BytesIO(data))
-    return buf.getvalue()
 
-def build_ipk():
-    OUTPUT_IPK.parent.mkdir(parents=True, exist_ok=True)
-    
-    # 1. debian-binary
-    debian_binary = b"2.0\n"
-    
-    # 2. control.tar.gz
-    control_content = (
-        "Package: org.webosbrew.lg-hue-sync\n"
-        f"Version: {VERSION}\n"
-        "Section: misc\n"
-        "Priority: optional\n"
-        "Architecture: all\n"
-        "Maintainer: Adam <adam@adeze.com>\n"
-        "Description: Philips Hue & Nanoleaf Ambient Lighting Controller for LG C1\n"
-    ).encode("utf-8")
-    
-    control_tar = make_tarfile_bytes({
-        "./control": (control_content, 0o644)
-    })
-    
-    # 3. data.tar.gz
-    data_files = {}
-    base_target = "usr/palm/applications/org.webosbrew.lg-hue-sync"
-    for item in APP_DIR.rglob("*"):
-        if item.is_file():
-            rel = item.relative_to(APP_DIR).as_posix()
-            arcname = f"./{base_target}/{rel}"
-            data_files[arcname] = (item.read_bytes(), 0o755 if item.suffix == ".sh" else 0o644)
-            
-    data_tar = make_tarfile_bytes(data_files)
-    
-    # Assemble AR archive
-    # Debian ar format:
-    # 8-byte magic: !<arch>\n
-    # Each entry: 60-byte header + data + optional padding \n if odd length
-    # Header:
-    # name (16 chars, slash-terminated: "debian-binary/  ")
-    # mtime (12 chars: "0           ")
-    # uid (6 chars: "0     ")
-    # gid (6 chars: "0     ")
-    # mode (8 chars: "100644  ")
-    # size (10 chars: left-justified)
-    # 2-byte magic: `\n
-    
-    def ar_entry(name, content):
-        header = io.BytesIO()
-        header.write(f"{name:<16}".encode("ascii"))
-        header.write(f"{'0':<12}".encode("ascii"))
-        header.write(f"{'0':<6}".encode("ascii"))
-        header.write(f"{'0':<6}".encode("ascii"))
-        header.write(f"{'100644':<8}".encode("ascii"))
-        header.write(f"{len(content):<10}".encode("ascii"))
-        header.write(b"`\n")
-        entry = header.getvalue() + content
-        if len(content) % 2 != 0:
-            entry += b"\n"
-        return entry
+def build_ipk(app_dir=APP_DIR, output_dir=OUTPUT_DIR):
+    app_dir, output_dir = Path(app_dir).resolve(), Path(output_dir).resolve()
+    info = json.loads((app_dir / "appinfo.json").read_text(encoding="utf-8"))
+    if not isinstance(info, dict):
+        raise ValueError("appinfo.json must contain a JSON object")
+    for key in ("id", "version", "type", "title", "appDescription"):
+        if not isinstance(info.get(key), str) or not info[key]:
+            raise ValueError(f"appinfo.json requires {key}")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", info["id"]):
+        raise ValueError("invalid application id")
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", info["version"]):
+        raise ValueError("application version must contain three numeric components")
+    packager = shutil.which("ares-rs-package")
+    if not packager:
+        raise RuntimeError("ares-rs-package is required; install the Rust ares-cli-rs tools")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_ipk = output_dir / f"{info['id']}_{info['version']}_all.ipk"
+    output_manifest = output_dir / f"{info['id']}.manifest.json"
+    with tempfile.TemporaryDirectory(prefix=".ares-package-", dir=output_dir) as temporary:
+        staging = Path(temporary)
+        subprocess.run(
+            [packager, str(app_dir), "--outdir", str(staging), "--force-arch", "all"],
+            check=True, timeout=120, stdout=sys.stderr, stderr=sys.stderr,
+        )
+        package = staging / output_ipk.name
+        if package.is_symlink() or not package.is_file():
+            raise RuntimeError(f"Ares did not produce the expected package: {output_ipk.name}")
+        manifest = {
+            "id": info["id"], "version": info["version"], "type": info["type"],
+            "title": info["title"], "appDescription": info["appDescription"],
+            "iconUri": "https://raw.githubusercontent.com/adeze/lg-hue-sync/main/webos-app/icon130.png",
+            "sourceUrl": "https://github.com/adeze/lg-hue-sync",
+            "rootRequired": True, "ipkUrl": output_ipk.name,
+            "ipkHash": {"sha256": hashlib.sha256(package.read_bytes()).hexdigest()},
+            "ipkSize": package.stat().st_size,
+        }
+        staged_manifest = staging / output_manifest.name
+        staged_manifest.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        os.replace(package, output_ipk)
+        os.replace(staged_manifest, output_manifest)
+    return output_ipk, output_manifest
 
-    with open(OUTPUT_IPK, "wb") as f:
-        f.write(b"!<arch>\n")
-        f.write(ar_entry("debian-binary", debian_binary))
-        f.write(ar_entry("control.tar.gz", control_tar))
-        f.write(ar_entry("data.tar.gz", data_tar))
 
-    manifest = {
-        "id": APP_INFO["id"],
-        "version": VERSION,
-        "type": APP_INFO["type"],
-        "title": APP_INFO["title"],
-        "appDescription": APP_INFO["appDescription"],
-        "iconUri": "https://raw.githubusercontent.com/adeze/lg-hue-sync/main/webos-app/icon130.png",
-        "sourceUrl": "https://github.com/adeze/lg-hue-sync",
-        "rootRequired": True,
-        "ipkUrl": OUTPUT_IPK.name,
-        "ipkHash": {"sha256": hashlib.sha256(OUTPUT_IPK.read_bytes()).hexdigest()},
-        "ipkSize": OUTPUT_IPK.stat().st_size,
-    }
-    OUTPUT_MANIFEST.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--print-path", action="store_true", help="package and print only the exact IPK path to stdout")
+    args = parser.parse_args()
+    try:
+        package, manifest = build_ipk()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        parser.exit(1, f"Packaging failed: {error}\n")
+    if args.print_path:
+        print(package)
+    else:
+        print(f"Successfully created {package} ({package.stat().st_size} bytes)")
+        print(f"Successfully created {manifest}")
 
-    print(f"Successfully created {OUTPUT_IPK} ({os.path.getsize(OUTPUT_IPK)} bytes)")
-    print(f"Successfully created {OUTPUT_MANIFEST}")
 
 if __name__ == "__main__":
-    build_ipk()
+    main()

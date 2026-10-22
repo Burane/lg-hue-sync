@@ -246,8 +246,37 @@ impl CalibrationPattern {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncState {
+    Starting,
+    Running,
+    Stopping,
+    Paused,
+    Recovering,
+    Faulted,
+    UnsupportedSource,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SyncStatus {
+    requested_running: bool,
+    pipeline_state: SyncState,
+    last_error: Option<String>,
+}
+
+impl SyncStatus {
+    fn toggle_should_stop(&self) -> bool {
+        match self.pipeline_state {
+            SyncState::Running => true,
+            SyncState::Paused | SyncState::Faulted => false,
+            _ => self.requested_running,
+        }
+    }
+}
+
 pub struct SharedState {
-    pub is_syncing: AtomicBool,
+    sync_status: RwLock<SyncStatus>,
     command_tx: mpsc::Sender<ControlCommand>,
     /// Capture polling ceiling, not the media frame rate.
     pub fps_x100: AtomicU32,
@@ -279,7 +308,11 @@ impl SharedState {
         command_tx: mpsc::Sender<ControlCommand>,
     ) -> Self {
         Self {
-            is_syncing: AtomicBool::new(true),
+            sync_status: RwLock::new(SyncStatus {
+                requested_running: true,
+                pipeline_state: SyncState::Starting,
+                last_error: None,
+            }),
             command_tx,
             fps_x100: AtomicU32::new(6000),
             light_updates_x100: AtomicU32::new(0),
@@ -327,11 +360,30 @@ impl SharedState {
         );
     }
 
+    pub fn set_sync_state(&self, state: SyncState, error: Option<String>) {
+        let mut status = self.sync_status.write().unwrap();
+        status.pipeline_state = state;
+        status.last_error = error;
+    }
+
+    pub fn set_requested_running(&self, requested: bool) {
+        self.sync_status.write().unwrap().requested_running = requested;
+    }
+
     async fn send_command(&self, command: ControlCommand) -> Result<(), ApiError> {
-        self.command_tx
-            .send(command)
+        let permit = self
+            .command_tx
+            .reserve()
             .await
-            .map_err(|_| ApiError::SetupFailed("sync controller is unavailable".to_string()))
+            .map_err(|_| ApiError::SetupFailed("sync controller is unavailable".to_string()))?;
+        let mut status = self.sync_status.write().unwrap();
+        match command {
+            ControlCommand::Start => status.requested_running = true,
+            ControlCommand::Stop => status.requested_running = false,
+            _ => {}
+        }
+        permit.send(command);
+        Ok(())
     }
 
     async fn apply_settings(&self, settings: LiveSettings) -> Result<(), ApiError> {
@@ -366,6 +418,8 @@ struct AppState {
 #[derive(Debug, Clone, Serialize)]
 struct StatusResponse {
     is_syncing: bool,
+    #[serde(flatten)]
+    sync: SyncStatus,
     tv_power_state: &'static str,
     fps: f32,
     light_update_fps: f32,
@@ -475,8 +529,10 @@ async fn capture_patterns() -> Html<&'static str> {
 
 async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
     let shared = &state.shared;
+    let sync = shared.sync_status.read().unwrap().clone();
     Json(StatusResponse {
-        is_syncing: shared.is_syncing.load(Ordering::Relaxed),
+        is_syncing: sync.pipeline_state == SyncState::Running,
+        sync,
         tv_power_state: match shared.tv_power_state.load(Ordering::Relaxed) {
             1 => "active",
             2 => "standby",
@@ -504,18 +560,22 @@ async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
 
 async fn start(State(state): State<AppState>) -> Result<Json<StatusMessage>, ApiError> {
     state.shared.send_command(ControlCommand::Start).await?;
-    state.shared.is_syncing.store(true, Ordering::SeqCst);
     Ok(Json(StatusMessage { status: "starting" }))
 }
 
 async fn stop(State(state): State<AppState>) -> Result<Json<StatusMessage>, ApiError> {
     state.shared.send_command(ControlCommand::Stop).await?;
-    state.shared.is_syncing.store(false, Ordering::SeqCst);
     Ok(Json(StatusMessage { status: "stopping" }))
 }
 
 async fn toggle(State(state): State<AppState>) -> Result<Json<StatusMessage>, ApiError> {
-    if state.shared.is_syncing.load(Ordering::SeqCst) {
+    let should_stop = state
+        .shared
+        .sync_status
+        .read()
+        .unwrap()
+        .toggle_should_stop();
+    if should_stop {
         stop(State(state)).await
     } else {
         start(State(state)).await
@@ -864,6 +924,116 @@ mod tests {
         assert_eq!(input.nanoleaf_alignment.perimeter_offset, 7);
         assert!(input.validate().is_ok());
         assert!(Preset::named("unknown").is_err());
+    }
+
+    #[tokio::test]
+    async fn control_requests_preserve_actual_state_until_controller_transition() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        let shared = Arc::new(SharedState::new(
+            settings(),
+            String::new(),
+            String::new(),
+            String::new(),
+            Vec::new(),
+            sender,
+        ));
+        shared.set_sync_state(SyncState::Paused, None);
+        shared.set_requested_running(false);
+        let state = AppState {
+            shared: shared.clone(),
+            config_path: PathBuf::new(),
+        };
+        let _ = start(State(state.clone())).await.unwrap();
+        let snapshot = status(State(state.clone())).await.0;
+        assert!(!snapshot.is_syncing);
+        assert!(snapshot.sync.requested_running);
+        assert_eq!(snapshot.sync.pipeline_state, SyncState::Paused);
+        assert!(matches!(receiver.recv().await, Some(ControlCommand::Start)));
+        shared.set_sync_state(SyncState::Starting, None);
+        assert!(!status(State(state.clone())).await.0.is_syncing);
+        shared.set_sync_state(SyncState::Running, None);
+        let _ = stop(State(state.clone())).await.unwrap();
+        let snapshot = status(State(state.clone())).await.0;
+        assert!(snapshot.is_syncing);
+        assert!(!snapshot.sync.requested_running);
+        assert!(matches!(receiver.recv().await, Some(ControlCommand::Stop)));
+        for phase in [
+            SyncState::Stopping,
+            SyncState::UnsupportedSource,
+            SyncState::Paused,
+            SyncState::Recovering,
+            SyncState::Faulted,
+        ] {
+            shared.set_sync_state(phase, Some("capture unavailable".into()));
+            let snapshot = status(State(state.clone())).await.0;
+            assert!(!snapshot.is_syncing);
+            let json = serde_json::to_value(snapshot).unwrap();
+            assert_eq!(json["requested_running"], false);
+            assert_eq!(json["last_error"], "capture unavailable");
+            assert!(json.get("fps").is_some());
+        }
+        shared.set_sync_state(SyncState::Running, None);
+        assert!(status(State(state)).await.0.sync.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn toggle_follows_actual_state_after_automatic_transitions() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let shared = Arc::new(SharedState::new(
+            settings(),
+            String::new(),
+            String::new(),
+            String::new(),
+            Vec::new(),
+            sender,
+        ));
+        let state = AppState {
+            shared: shared.clone(),
+            config_path: PathBuf::new(),
+        };
+        shared.set_requested_running(false);
+        shared.set_sync_state(SyncState::Running, None);
+        let _ = toggle(State(state.clone())).await.unwrap();
+        assert!(matches!(receiver.recv().await, Some(ControlCommand::Stop)));
+        for phase in [SyncState::Paused, SyncState::Faulted] {
+            shared.set_requested_running(true);
+            shared.set_sync_state(phase, None);
+            let _ = toggle(State(state.clone())).await.unwrap();
+            assert!(matches!(receiver.recv().await, Some(ControlCommand::Start)));
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_or_full_command_queue_does_not_change_request_or_actual_state() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender.send(ControlCommand::Restart).await.unwrap();
+        let shared = SharedState::new(
+            settings(),
+            String::new(),
+            String::new(),
+            String::new(),
+            Vec::new(),
+            sender,
+        );
+        shared.set_requested_running(false);
+        shared.set_sync_state(SyncState::Faulted, Some("capture busy".into()));
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            shared.send_command(ControlCommand::Start)
+        )
+        .await
+        .is_err());
+        assert!(!shared.sync_status.read().unwrap().requested_running);
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ControlCommand::Restart)
+        ));
+        drop(receiver);
+        assert!(shared.send_command(ControlCommand::Start).await.is_err());
+        let snapshot = shared.sync_status.read().unwrap();
+        assert!(!snapshot.requested_running);
+        assert_eq!(snapshot.pipeline_state, SyncState::Faulted);
+        assert_eq!(snapshot.last_error.as_deref(), Some("capture busy"));
     }
 
     #[tokio::test]

@@ -17,6 +17,9 @@ RUST_VERSION   ?= stable
 CROSS_IMAGE    ?= lg-hue-sync-cross:rust-$(RUST_VERSION)
 CARGO_CACHE    ?= lg-hue-sync-cargo
 TARGET_CACHE   ?= lg-hue-sync-target
+WEBOS_NATIVE_HOME ?= $(HOME)/.local/share/webosbrew-rust
+ARES_DEVICE    ?=
+APP_ID         := org.webosbrew.lg-hue-sync
 
 SSH_OPTS       := -p $(SSH_PORT) -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5
 SCP_OPTS       := -P $(SSH_PORT) -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5
@@ -29,7 +32,7 @@ YELLOW := \033[33m
 RED    := \033[31m
 RESET  := \033[0m
 
-.PHONY: help setup check toolchain-update require-tv cross-image build build-local test test-pattern deps-check deps-update release-check \
+.PHONY: help setup check toolchain-update docker-toolchain-update require-tv cross-image build build-docker native-setup build-native package-app require-ares-device install-app launch-app list-apps build-local test test-pattern deps-check deps-update release-check \
         deploy deploy-bin deploy-config deploy-app provision-luna status logs start stop restart \
         test-capture ssh root pair clean cross-clean
 
@@ -38,9 +41,15 @@ help:
 	@printf "$(BOLD)LG Hue Sync — Automation Commands$(RESET)\n\n"
 	@printf "$(CYAN)Build Targets:$(RESET)\n"
 	@printf "  $(GREEN)make cross-image$(RESET)   Build the cached Debian Buster/Rust cross-toolchain image\n"
-	@printf "  $(GREEN)make toolchain-update$(RESET) Refresh stable Rust, rebuild the Docker toolchain, check and build\n"
-	@printf "  $(GREEN)make build$(RESET)         Cross-compile release binary for LG webOS (ARMv7, Debian Buster container)\n"
+	@printf "  $(GREEN)make toolchain-update$(RESET) Refresh stable Rust, check and build natively\n"
+	@printf "  $(GREEN)make build$(RESET)         Cross-compile ARMv7 release on Mac using webOS SDK/Buster sysroot\n"
+	@printf "  $(GREEN)make build-docker$(RESET)  Explicit cached Docker fallback (also used by Linux CI)\n"
+	@printf "  $(GREEN)make docker-toolchain-update$(RESET) Rebuild fallback image with current stable Rust\n"
 	@printf "  $(GREEN)make build-local$(RESET)   Build binary for host OS (macOS) via local cargo\n"
+	@printf "  $(GREEN)make native-setup$(RESET)  Prepare Mac SDK/Buster sysroot from cached builder once\n"
+	@printf "  $(GREEN)make build-native$(RESET)  Build verified ARMv7 binary on Mac without Docker\n"
+	@printf "  $(GREEN)make package-app$(RESET)   Package launcher locally using Rust Ares\n"
+	@printf "  $(GREEN)make install-app/launch-app/list-apps ARES_DEVICE=<name>$(RESET) Manage launcher via Rust Ares\n"
 	@printf "  $(GREEN)make clean$(RESET)         Clean host build artifacts\n"
 	@printf "  $(GREEN)make cross-clean$(RESET)   Remove cross-build image and Docker caches\n\n"
 	@printf "$(CYAN)Testing & Validation:$(RESET)\n"
@@ -72,12 +81,16 @@ help:
 cross-image:
 	docker build --build-arg RUST_VERSION=$(RUST_VERSION) -t $(CROSS_IMAGE) -f docker/Dockerfile.cross docker
 
-## refresh the stable host and Docker toolchains, then verify the project
+## refresh stable Rust and verify the default native build
 toolchain-update:
 	rustup update stable
+	$(MAKE) check build
+
+## explicitly refresh the cached Docker fallback
+docker-toolchain-update:
 	docker build --pull --no-cache --build-arg RUST_VERSION=$(RUST_VERSION) -t $(CROSS_IMAGE) -f docker/Dockerfile.cross docker
 	docker run --rm $(CROSS_IMAGE) rustc --version
-	$(MAKE) check build
+	$(MAKE) check build-docker
 
 ## prepare a local/Codex worktree without building the Docker target image
 setup:
@@ -92,8 +105,11 @@ check: release-check
 	perl -0777 -ne 'print $$1 if /<script>(.*)<\/script>/s' src/web/ui.html | node --check -
 	git diff --check
 
-## cross-compile ARMv7 binary matching webOS 6.x glibc 2.28
-build: cross-image
+## default TV build; never silently fall back to another toolchain
+build: build-native
+
+## explicit Docker fallback matching webOS 6.x glibc 2.28
+build-docker: cross-image
 	@printf "$(CYAN)[*] Cross-compiling for $(TARGET) in Debian Buster container...$(RESET)\n"
 	docker run --rm \
 	  -v "$$PWD":/app -w /app \
@@ -101,6 +117,29 @@ build: cross-image
 	  -v $(TARGET_CACHE):/target-cache \
 	  $(CROSS_IMAGE)
 	@printf "$(GREEN)[+] Build complete: $(BINARY) ($$(du -h $(BINARY) | cut -f1))$(RESET)\n"
+
+## prepare reusable host-native cross tools from an existing SDK and cached builder
+native-setup:
+	WEBOS_NATIVE_HOME="$(WEBOS_NATIVE_HOME)" CROSS_IMAGE="$(CROSS_IMAGE)" bash scripts/setup-native-toolchain.sh
+
+build-native:
+	@test -x "$(WEBOS_NATIVE_HOME)/bin/webos-native-build" || { echo "Native tools missing: run make native-setup, or use make build-docker." >&2; exit 2; }
+	bash "$(WEBOS_NATIVE_HOME)/bin/webos-native-build" "$(CURDIR)/Cargo.toml" lg-hue-sync "$(CURDIR)/$(BINARY)"
+
+package-app:
+	uv run scripts/package_ipk.py
+
+require-ares-device:
+	@test -n "$(ARES_DEVICE)" || { echo "ARES_DEVICE is required; select a registered device explicitly." >&2; exit 2; }
+
+install-app: require-ares-device
+	IPK_PATH=$$(uv run scripts/package_ipk.py --print-path); ares-rs-install --device "$(ARES_DEVICE)" "$$IPK_PATH"
+
+launch-app: require-ares-device
+	ares-rs-launch --device "$(ARES_DEVICE)" "$(APP_ID)"
+
+list-apps: require-ares-device
+	ares-rs-install --device "$(ARES_DEVICE)" --list
 
 ## build binary locally on host machine
 build-local:
@@ -172,9 +211,7 @@ deploy-config: require-tv
 ## package and deploy webOS application to Home Dashboard ribbon
 deploy-app: require-tv
 	@printf "$(CYAN)[*] Packaging webOS application...$(RESET)\n"
-	uv run scripts/package_ipk.py
-	@printf "$(CYAN)[*] Installing application on TV...$(RESET)\n"
-	IPK_PATH=$$(find target -maxdepth 1 -name 'org.webosbrew.lg-hue-sync_*_all.ipk' -type f | sort | tail -1); test -n "$$IPK_PATH"; scp $(SCP_OPTS) "$$IPK_PATH" root@$(TV_IP):/tmp/org.webosbrew.lg-hue-sync.ipk
+	IPK_PATH=$$(uv run scripts/package_ipk.py --print-path); scp $(SCP_OPTS) "$$IPK_PATH" root@$(TV_IP):/tmp/org.webosbrew.lg-hue-sync.ipk
 	ssh $(SSH_OPTS) root@$(TV_IP) "luna-send -n 1 -f luna://com.webos.appInstallService/dev/install '{\"id\":\"org.webosbrew.lg-hue-sync\", \"ipkUrl\":\"/tmp/org.webosbrew.lg-hue-sync.ipk\", \"subscribe\":false}'"
 	@printf "$(GREEN)[+] Application installed on TV Home Dashboard.$(RESET)\n"
 

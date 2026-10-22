@@ -1,6 +1,4 @@
 use serde_json::Value;
-use std::time::Duration;
-use tokio::{process::Command, time::timeout};
 
 const VIDEO_STATUS_URI: &str = "luna://com.webos.service.videooutput/getStatus";
 const PICTURE_SETTINGS_URI: &str = "luna://com.webos.settingsservice/getSystemSettings";
@@ -56,20 +54,7 @@ fn parse_picture_settings(value: &Value) -> DynamicRange {
 }
 
 async fn luna_query(uri: &str, payload: &str) -> Option<Value> {
-    let output = timeout(
-        Duration::from_millis(1500),
-        Command::new("/usr/bin/luna-send")
-            .kill_on_drop(true)
-            .args(["-n", "1", "-f", "-w", "1000", uri, payload])
-            .output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value: Value = serde_json::from_slice(&output.stdout).ok()?;
+    let value = crate::luna::query(uri, payload).await.ok()?;
     if value.get("returnValue") == Some(&Value::Bool(false)) {
         return None;
     }

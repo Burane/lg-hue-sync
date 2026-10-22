@@ -29,13 +29,52 @@ The dashboard's `/capture-patterns` page shows nominal SDR patches. Load it in t
 
 `test-capture --raw-nv12-stats` requires free vtCapture hardware and prints five central Y/Cb/Cr summaries plus the TV's read-only reported dynamic-range mode. It never saves full frames. Stop the daemon before each probe, then restart it even if the probe fails. Confirm the service is active again; the existing `make test-capture` target does not manage that lifecycle. The mode label is a TV output hint, not capture colour-space metadata. Do not change the fixed BT.601 decoder based on a mode label alone.
 
+## Compatible inputs and automatic pause
+
+The supported capture policy is HDMI-only. A bounded foreground-app observation
+checks the standard Luna `getForegroundAppInfo` interface every two seconds.
+Known HDMI app IDs 1–4 permit capture; built-in apps (including Netflix) and Home
+release capture/output sessions and report `pipeline_state: unsupported_source`.
+The dashboard explains that it is waiting for HDMI rather than retrying the
+unsupported input indefinitely. Returning to HDMI retries capture automatically
+only when the input policy paused it. Manual Stop stays stopped across input
+changes; Start on an unsupported input arms the next compatible HDMI transition.
+Restart does not attempt capture while the foreground source is unsupported.
+
+An unsuccessful source query preserves the last known policy. App identity is
+an input-compatibility policy, not evidence of DRM; `vtCapture_init` code 17 has
+not been canonically mapped to a DRM condition. PicCap documents limitations for
+[built-in Netflix/Amazon protected playback](https://github.com/webosbrew/piccap#piccap).
+This release does not attempt to bypass those restrictions.
+
+Source, power, dynamic-range and frame-rate observations use `src/luna.rs`:
+1.5-second deadline, 64 KiB reply limit and killed/reaped failed children. It
+retains piped stdin until the reply because this firmware's `luna-send` otherwise
+silently exits at EOF. Frame-rate polling is capped at once every two seconds.
+No foreground-app identifiers, titles or reply bodies are exposed in error logs.
+
+For TV validation, observe HDMI → app/Home → HDMI, verify capture release and
+automatic recovery, then repeat after manual Stop to confirm it stays stopped.
+Check actual capture readiness, not just process health or connection flags.
+
+The native v0.7.0 candidate passed the first live transition on 2026-10-22:
+`running`/hardware true/60 FPS → `unsupported_source`/hardware false/both rates
+zero → `running`/hardware true/60 FPS, with its error cleared automatically.
+Local/remote binary SHA-256 matched and the paired configuration checksum stayed
+unchanged. Source-policy tests cover manual Stop surviving source changes.
+
 ## Codex project setup
 
 Codex loads [`.codex/environments/environment.toml`](../.codex/environments/environment.toml) from this repository. It sets up new worktrees with `make setup` and adds actions to update dependencies, refresh Rust stable, validate/build, transfer to the TV, and clean Docker builds. Leave automatic worktree cleanup empty so reusable Docker caches survive.
 
 The transfer action reads `TV_IP=<tv-ip>` from `~/.config/lg-hue-sync/device.env` on the local host, or from its terminal environment. Add `SSH_PORT=<port>` there only if it differs from 22. This file stays outside Git and is not copied into a worktree.
 
-Docker Desktop must be running for toolchain update, build, transfer, and cache-clean actions. Ordinary builds reuse the most recently built stable Rust image; **Update Rust toolchain** refreshes stable Rust on the host, rebuilds the image without Docker's layer cache, then runs host checks and the ARM build. Transfer preserves the TV's paired `config.json`, verifies the uploaded binary checksum, and restarts the daemon.
+Ordinary builds and transfers no longer require Docker after native setup.
+**Update Rust toolchain** refreshes rustup stable, runs host checks, and builds
+natively. Docker must be running for explicit fallback/image/cache operations;
+`make docker-toolchain-update` refreshes its image separately. Transfer preserves
+the TV's paired `config.json`, verifies the uploaded binary checksum, and restarts
+the daemon.
 
 ## Target build
 
@@ -48,9 +87,27 @@ llvm-readelf --version-info target/armv7-unknown-linux-gnueabi/release/lg-hue-sy
 
 Required result: 32-bit ARM Linux ELF with no required symbol newer than `GLIBC_2.28`. On Linux, GNU `readelf` is equivalent.
 
-`make build` uses `docker/Dockerfile.cross`, which bakes the archived Debian Buster packages, the stable Rust toolchain, ARMv7 target, and linker into `lg-hue-sync-cross`. The cached image remains at its installed Rust release until `make toolchain-update` refreshes it. Cargo registry and target artifacts live in named Docker volumes, so subsequent builds are incremental. `make cross-clean` removes this project's cross-toolchain images and both caches when disk space matters.
+`make build` aliases `make build-native`: the macOS webOS SDK compiler links
+against the extracted Buster sysroot. See setup below. Missing native tools fail
+with setup/fallback instructions; no automatic toolchain switch occurs.
 
-Codex and developers use this same target rather than maintaining separate toolchains. GitHub Actions also runs it on every push to `main`; the ordinary CI job separately checks formatting, host tests, Clippy, and embedded dashboard JavaScript.
+`make build-docker` explicitly uses `docker/Dockerfile.cross`, which bakes the
+archived Buster packages, stable Rust, ARM target and linker into the cached
+builder. The image stays at its installed Rust version until
+`make docker-toolchain-update` refreshes it. Named Cargo/target volumes preserve
+incremental fallback builds. `make cross-clean` removes the image and those
+volumes; it does not remove the native SDK/sysroot/cache.
+
+Codex and local developers use the native default. Linux GitHub Actions explicitly
+runs `make build-docker`; its ordinary job separately checks formatting, host
+tests, Clippy, and embedded dashboard JavaScript. Both build paths target the
+same soft-float ABI and glibc ceiling.
+
+The initial hard-float GNU/musl `cross-rs` configuration and host Cargo linker
+overrides have been removed; no repository workflow used them. The supported
+TV target is `armv7-unknown-linux-gnueabi`, with its linker configured inside
+the native helper or cached Docker image. Host Cargo builds keep their native target. Alternate
+ABIs require separate ELF, libc and TV runtime validation before adoption.
 
 ## Dependencies
 
@@ -65,18 +122,96 @@ Dependency updates are deliberate direct-to-`main` changes: inspect `Cargo.lock`
 
 [`webosbrew/native-toolchain`](https://github.com/webosbrew/native-toolchain) is the community reference SDK. On macOS, download the matching Darwin archive, extract it to a path without spaces, and run its `relocate-sdk.sh`. Its CMake toolchain file is under `share/buildroot/toolchainfile.cmake`.
 
-It was evaluated for this Rust repository, not ignored. Relocation repairs its original CI sysroot path, but the current Rust dependency graph still fails to link because the SDK libc lacks `getauxval`, required by Rust's supported `armv7-unknown-linux-gnueabi` standard library and `ring`.
+The SDK's original libc is older than our Buster baseline. Earlier linking failed at `getauxval`; the SDK also includes compatibility polyfills, which this build deliberately avoids. Use its native macOS compiler and ARM archive tools with the actual Buster headers/libraries instead:
 
-Do not add a fake `getauxval` shim. Reconsider the native SDK when either:
+```bash
+make native-setup  # once: requires installed SDK and already cached Docker builder
+make build-native  # subsequent builds use Mac tools; Docker need not run
+```
 
-- the SDK libc exports `getauxval`; or
-- a custom Rust standard library built against its sysroot passes tests, ELF inspection, and a supervised TV probe.
+`native-setup` installs reusable helpers and a 25 MiB sysroot under
+`~/.local/share/webosbrew-rust`, recording the cached builder's image ID. It never
+pulls/rebuilds an image or downloads another SDK. Existing sysroots are reused.
+The SDK defaults to
+`~/.local/share/webosbrew-native-toolchain/arm-webos-linux-gnueabi_sdk-buildroot`.
+For another installation, export `WEBOS_SDK` for both setup and builds. Override
+`WEBOS_NATIVE_HOME` consistently to relocate the installed helpers/sysroot.
 
-Until then, the Debian Buster container is canonical. [`hyperhdr-webos-loader`](https://github.com/webosbrew/hyperhdr-webos-loader) remains the reference for native service, frontend, autostart, and IPK layout; it uses the same Buildroot SDK, but does not solve this Rust libc boundary.
+The native helper explicitly selects rustup's stable Cargo/rustc and ARM target;
+Homebrew Rust can otherwise shadow them. It sets target-specific GCC, `ar` and
+`ranlib`, disables SDK libc polyfills, and builds into `target/native`. Before
+atomically replacing the normal ARM release artifact, it verifies ELF32,
+little-endian ARM EABI5, soft-float ABI, `/lib/ld-linux.so.3`, and glibc <= 2.28.
+Failures preserve the previous artifact. No custom Rust compiler, standard
+library or fake `getauxval` shim is needed.
 
-[`openlgtv/buildroot-nc4`](https://github.com/openlgtv/buildroot-nc4) is the Buildroot source used by the community toolchain. Rebuilding or forking it would be a separate SDK maintenance project; it does not by itself resolve the current Rust `getauxval` link failure. Keep the cached container build unless a candidate SDK passes the link, ELF/glibc inspection, and supervised TV checks above.
+`make build` now selects the native build; `make build-docker` is the explicit
+fallback. Both produce the same artifact path, so
+`make deploy-bin TV_IP=<tv-ip>` can transfer either after an explicitly requested
+deployment. `./scripts/deploy.sh` follows the native default unless `--reuse` is
+explicitly supplied. To deploy a freshly verified Docker artifact, run
+`make build-docker` then `make deploy-bin TV_IP=<tv-ip>`.
+
+The native v0.6.1 artifact was tested on the TV on 2026-10-22. Local/remote SHA-256
+matched; the prior binary was retained and the paired configuration checksum
+stayed unchanged. The dashboard responded, systemd reported active/running with
+zero restarts, hardware capture ran at 320x180/60 FPS, and both Hue and Nanoleaf
+reported connected. This verifies this artifact's service/capture integration,
+not physical lighting quality or every future build.
+
+[`hyperhdr-webos-loader`](https://github.com/webosbrew/hyperhdr-webos-loader)
+remains the reference for native service, frontend, autostart, and IPK layout.
+
+[`openlgtv/buildroot-nc4`](https://github.com/openlgtv/buildroot-nc4) is the Buildroot source used by the community toolchain. Rebuilding or forking it would be a separate SDK maintenance project. Keep the cached container as a recoverable fallback until supervised TV checks pass.
 
 For native LG capture interfaces, consult [`webosbrew/webos-userland`](https://github.com/webosbrew/webos-userland/tree/main) and its [generated API reference](https://www.webosbrew.org/webos-userland/index.html). These are community headers and stub libraries, not proof that a symbol or capture mode works on this TV firmware. Keep runtime symbol checks and frame validation at the capture boundary.
+
+### Experimental Zig cross-build
+
+[`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild#specify-glibc-version)
+can link the daemon without Docker or the webOS SDK. The 2026-10-22 probe used
+`cargo-zigbuild 0.24.0`, `ziglang 0.17.0` and rustup stable `rustc 1.99.1`.
+The locked v0.6.1 release build completed in about 95 seconds with four jobs.
+From the repository root, this isolated invocation leaves the normal release
+artifact untouched and installs no global tools:
+
+```bash
+(
+set -eu
+ZIG_PROBE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/lg-zig-probe.XXXXXX")"
+uv venv "$ZIG_PROBE_DIR/venv"
+uv pip install --python "$ZIG_PROBE_DIR/venv/bin/python" cargo-zigbuild==0.24.0 ziglang==0.17.0
+ZIG_PROBE_RUSTC="$(rustup which --toolchain stable rustc)"
+ZIG_PROBE_CARGO="$(rustup which --toolchain stable cargo)"
+env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS -u CARGO_BUILD_TARGET \
+  -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER \
+  -u CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABI_LINKER \
+  -u CC_armv7_unknown_linux_gnueabi -u AR_armv7_unknown_linux_gnueabi \
+  -u RANLIB_armv7_unknown_linux_gnueabi \
+  -u CPATH -u C_INCLUDE_PATH -u CPLUS_INCLUDE_PATH -u LIBRARY_PATH \
+  PATH="$ZIG_PROBE_DIR/venv/bin:$PATH" RUSTUP_TOOLCHAIN=stable \
+  RUSTC="$ZIG_PROBE_RUSTC" CARGO="$ZIG_PROBE_CARGO" \
+  CARGO_TARGET_DIR="$ZIG_PROBE_DIR/target" CARGO_BUILD_JOBS=4 \
+  CARGO_ZIGBUILD_PYTHON_PATH="$ZIG_PROBE_DIR/venv/bin/python" \
+  CARGO_ZIGBUILD_ZIG_PATH="$ZIG_PROBE_DIR/venv/bin/python-zig" \
+  CARGO_ZIGBUILD_CACHE_DIR="$ZIG_PROBE_DIR/cargo-zig-cache" \
+  ZIG_GLOBAL_CACHE_DIR="$ZIG_PROBE_DIR/zig-cache" \
+  ZIG_LOCAL_CACHE_DIR="$ZIG_PROBE_DIR/zig-local-cache" \
+  rustup run stable cargo zigbuild --locked --release --jobs 4 \
+    --target armv7-unknown-linux-gnueabi.2.28 \
+    --manifest-path "$PWD/Cargo.toml" --bin lg-hue-sync
+printf 'Candidate: %s\n' "$ZIG_PROBE_DIR/target/armv7-unknown-linux-gnueabi/release/lg-hue-sync"
+)
+```
+
+The candidate passed SDK `readelf` checks: ELF32 little-endian ARM EABI5,
+soft-float ABI, `/lib/ld-linux.so.3`, and maximum imported glibc version 2.28.
+The lockfile and normal release artifact hashes stayed unchanged. This proves
+local compilation and the inspected ABI, not TV execution. Zig's glibc suffix
+has upstream caveats; every candidate still needs the same ELF/loader/symbol
+checks and supervised TV validation. No candidate is copied, deployed or
+published by this command. The native build remains the default and the cached
+Docker build remains the validated fallback.
 
 ## First install
 
@@ -100,7 +235,27 @@ ares-rs-push --device tv <local-file> <remote-path>
 ares-rs-shell --device tv --run '<command>'
 ```
 
-Node equivalents (`ares-package`, `ares-install`, `ares-push`, `ares-shell`) remain supported. The `ares-rs-*` names are local aliases for upstream's `ares-*` Rust binaries. Ares can package and install the launcher app and transfer files, but the repository's deploy scripts currently use `scripts/package_ipk.py` and SSH/Luna. Root-owned daemon/service provisioning stays on the SSH workflow until the IPK owns and verifies the complete install/uninstall lifecycle.
+The `ares-rs-*` names are local aliases for upstream's Rust binaries; Node commands
+remain unchanged. `scripts/package_ipk.py` now delegates archive generation to
+`ares-rs-package`, preserving the local Homebrew manifest/hash. Packaging failure
+preserves prior outputs. Deployment consumes the exact current appinfo version,
+not the last filename found in `target`.
+
+```bash
+make package-app                           # local only
+make list-apps ARES_DEVICE=<registered-name>
+make install-app ARES_DEVICE=<registered-name>
+make launch-app ARES_DEVICE=<registered-name>
+uv run python scripts/test_package_ipk.py
+uv run python scripts/test_native_toolchain.py
+```
+
+Device-facing targets require an explicit device name. `install-app` installs
+only the launcher: it does not provision, update or uninstall the daemon.
+Existing IP-based deployment retains SSH/Luna for root service ownership,
+configuration preservation and rollback. Full deployment packages locally before
+any TV mutation. Do not publish the launcher-only IPK or its generated manifest
+as a complete daemon installer.
 
 ## Safe binary update
 
@@ -127,6 +282,14 @@ curl --fail --silent http://<tv-ip>:8088/api/status
 ```
 
 Match digests, require `active`, and inspect dashboard JSON. Physical capture-to-light behavior needs a visible check; a healthy process alone is insufficient.
+
+For control integration, use `POST /api/start` and `POST /api/stop`, then read
+`GET /api/status`. `requested_running` acknowledges the latest accepted HTTP intent;
+`pipeline_state` reports actual progress, and `last_error` retains capture failures.
+`is_syncing` is true only after a valid hardware frame, not when a command is queued.
+Check Hue/Nanoleaf connection flags and light-update rate separately. Stop releases the
+capture owner and zeros paused rates; Start reacquires it. A paused daemon still serves
+the API. Process start/stop/restart remains systemd's responsibility.
 
 ## Rollback
 

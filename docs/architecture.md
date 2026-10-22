@@ -16,6 +16,21 @@ Dashboard actions enter the daemon through a bounded typed command channel. `src
 coalesces desired start/stop state while preserving restart, reconfiguration, save, and Bridge
 refresh actions. Runtime output state remains distinct from the persisted configuration.
 
+`GET /api/status` distinguishes `requested_running` (the most recently accepted HTTP
+start/stop intent) from `pipeline_state` (`starting`, `running`, `stopping`, `paused`,
+`recovering`, or `faulted`). The compatible `is_syncing` field is true only after a
+real hardware frame is received and false during pause, recovery, and faults. Output
+connection flags and `light_update_fps` remain separate evidence of light streaming.
+`last_error` reports the latest capture failure and clears after a valid hardware frame
+or a new start/restart. A queued control response acknowledges intent, not completion.
+Read status after commands to observe the transition. A full or closed command channel
+does not change accepted intent.
+
+Pause and shutdown drop the capture owner through its existing RAII teardown before
+reporting `paused`. Hardware release still requires on-TV verification. Resume creates a fresh capture instance; a restart
+while intentionally paused retains that pause and does not acquire hardware. An explicit
+Start or Restart retries a capture fault. Standby startup does not initialize capture.
+
 `src/hue/reconnect.rs` serializes Hue activation, DTLS connection and cleanup on a dedicated
 worker. Generation checks discard results superseded by stop, disable or area changes; retries
 do not block Nanoleaf or command processing. DTLS handshakes share a five-second deadline;
@@ -72,7 +87,23 @@ Hue v2 may group several physical gradient segments into one Entertainment chann
 
 ## Native API references
 
+Foreground source policy and user intent are separate. `CaptureSourcePolicy`
+auto-pauses known non-HDMI apps/Home, releases capture/output sessions, and
+resumes on HDMI only when the policy caused the pause. Manual Stop cancels that
+resume; failed observations retain the last known compatibility. The dashboard's
+`unsupported_source` state is a policy decision, not DRM detection.
+All Luna observations share `src/luna.rs`, with a 1.5-second deadline, 64 KiB
+reply bound and stdin held until reply to avoid this firmware's EOF behavior.
+
 [`webosbrew/webos-userland`](https://github.com/webosbrew/webos-userland/tree/main) provides community headers and stub libraries for LG userland APIs; its [generated reference](https://www.webosbrew.org/webos-userland/index.html) is useful when reviewing capture bindings. Treat availability and ABI behavior as firmware-specific and keep defensive dynamic loading and frame checks in `src/capture/`.
+
+Use the [DILE VT reference](https://www.webosbrew.org/webos-userland/df/d73/dile__vt_8h.html)
+and [Hyperion's native backends](https://github.com/webosbrew/hyperion-webos/tree/main/unicapture/backends)
+as lifecycle references. The existing vtCapture owner performs stop, postprocess, finalize,
+and release; the DILE owner stops, unmaps buffers, and destroys its handle. Current DILE
+headers and older backend examples disagree on some function signatures, including Stop.
+Do not replace firmware-tested bindings solely to match generated documentation. Native
+stubs describe an ABI; they neither implement capture nor prove runtime availability.
 
 [`HyperHDR`](https://github.com/awawa-dev/HyperHDR) is an ambient-light design reference. Its [colour engine](https://github.com/awawa-dev/HyperHDR/wiki/Infinite-color-engine) retains float precision through averaging, correction, and smoothing; its [LUT calibration](https://github.com/awawa-dev/HyperHDR/wiki/lut-calibration) first identifies the source conversion. This daemon currently assumes BT.601 limited-range NV12 in both capture paths, then repeatedly converts processing results to 8-bit RGB. Hue xy output linearizes sRGB, but Hue Direct RGB expands each 8-bit channel to 16 bits without restoring precision. The legacy `hdr_tone_mapping` setting lifts midtones in 8-bit RGB and has no capture transfer or HDR metadata; new configurations leave it off, while existing configurations preserve their setting. It is not a validated HDR10/Dolby Vision conversion.
 

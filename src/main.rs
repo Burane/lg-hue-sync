@@ -1,8 +1,10 @@
 mod capture;
+mod capture_source;
 mod color;
 mod config;
 mod hue;
 mod local_http;
+mod luna;
 mod nanoleaf;
 mod runtime;
 mod setup;
@@ -22,8 +24,8 @@ use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use capture::{
-    create_capture, detect_source_fps, CaptureRecovery, MockCapture, RecoveryAction, ScreenCapture,
-    VtCapture,
+    create_capture, detect_source_fps, release_capture, CaptureRecovery, MockCapture,
+    RecoveryAction, ScreenCapture, VtCapture,
 };
 use color::{RgbColor, ZoneSampler};
 use config::{Config, ConfigError};
@@ -31,9 +33,9 @@ use hue::{
     reconnect::HueReconnect, sync_entertainment_areas, HueDtlsClient, HueStreamPacketBuilder,
 };
 use nanoleaf::{NanoleafPerimeterSampler, NanoleafUdpStreamer};
-use runtime::{PendingCommands, PipelineState, RetryState};
+use runtime::{CaptureSourcePolicy, PendingCommands, PipelineState, RetryState};
 use setup::{run_pair, run_pair_nanoleaf, run_sync_hue};
-use web::{start_web_server, CalibrationPattern, LiveSettings, SharedState};
+use web::{start_web_server, CalibrationPattern, LiveSettings, SharedState, SyncState};
 
 #[derive(Parser)]
 #[command(name = "lg-hue-sync")]
@@ -311,7 +313,12 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
     } else {
         None
     };
-    let pipeline_should_run = observed_tv_power != Some(false);
+    let startup_requested = observed_tv_power != Some(false);
+    let initial_source = crate::capture_source::current_source().await;
+    info!("Foreground capture source: {}", initial_source.label());
+    let mut source_policy =
+        CaptureSourcePolicy::new(initial_source.compatible(), startup_requested);
+    let pipeline_should_run = startup_requested && !source_policy.blocked();
     if !pipeline_should_run && hue_active {
         let _ = set_hue_stream_active(&config, false);
     }
@@ -496,11 +503,18 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
     }
 
     // 3. Initialize capture
-    let mut capture = create_capture(config.capture_width, config.capture_height);
+    let mut capture: Box<dyn ScreenCapture> = if pipeline_should_run {
+        create_capture(config.capture_width, config.capture_height)
+    } else {
+        Box::new(MockCapture::new(
+            config.capture_width,
+            config.capture_height,
+        ))
+    };
 
     // Determine target framerate (supports auto-matching source refresh rate 23.976..60.0 Hz)
     let detected_fps = if config.fps == 0 {
-        detect_source_fps()
+        detect_source_fps().await
     } else {
         None
     };
@@ -578,9 +592,10 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
         config.zones.clone(),
         command_tx,
     ));
-    shared_state
-        .is_syncing
-        .store(pipeline_should_run, Ordering::Relaxed);
+    shared_state.set_requested_running(startup_requested);
+    if !pipeline_should_run {
+        shared_state.set_sync_state(SyncState::Paused, None);
+    }
     shared_state.set_tv_power_state(observed_tv_power);
     shared_state.set_fps(target_fps as f32);
 
@@ -630,6 +645,7 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
     let mut capture_faulted = false;
     let mut last_tv_power_poll = tokio::time::Instant::now() - Duration::from_secs(2);
     let mut last_tv_power_warning = tokio::time::Instant::now() - Duration::from_secs(30);
+    let mut last_source_fps_poll = tokio::time::Instant::now();
     let mut hue_retry = RetryState::new();
     let mut nanoleaf_retry = RetryState::new();
     let mut nanoleaf_only_frame_count = 0u64;
@@ -638,6 +654,7 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
         desired_running: (!pipeline_should_run).then_some(false),
         ..PendingCommands::default()
     };
+    let mut last_source_poll = tokio::time::Instant::now() - Duration::from_secs(2);
     let mut pipeline_state = if pipeline_should_run {
         PipelineState::Running
     } else {
@@ -646,10 +663,16 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
 
     'sync_loop: while running.load(Ordering::SeqCst) {
         pending_commands.receive(&mut command_rx);
+        source_policy.manual_request(pending_commands.manual_running.take());
         let loop_start = tokio::time::Instant::now();
         let mut emitted_light_update = false;
 
         watchdog.tick();
+
+        if last_source_poll.elapsed() >= Duration::from_secs(2) {
+            last_source_poll = tokio::time::Instant::now();
+            source_policy.observe(crate::capture_source::current_source().await.compatible());
+        }
 
         if auto_tv_power && last_tv_power_poll.elapsed() >= Duration::from_secs(2) {
             last_tv_power_poll = tokio::time::Instant::now();
@@ -665,7 +688,9 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                             "TV power changed: {}",
                             if active { "active" } else { "standby" }
                         );
-                        if pending_commands.desired_running.is_none() {
+                        if pending_commands.desired_running.is_none()
+                            && !source_policy.manually_stopped()
+                        {
                             pending_commands.desired_running = Some(active);
                         }
                     }
@@ -711,12 +736,34 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
             hue_status.request(None);
         }
 
-        if web_stop_requested || external_stop || pipeline_state == PipelineState::Paused {
+        if source_policy.blocked()
+            && pipeline_state == PipelineState::Running
+            && !capture_faulted
+            && !web_stop_requested
+            && !external_stop
+        {
+            source_policy.pause_for_source();
+        }
+        if web_stop_requested
+            || external_stop
+            || pipeline_state == PipelineState::Paused
+            || source_policy.blocked()
+        {
             info!(
                 "Sync was stopped/paused (web={}, external={}). Entering paused idle state...",
                 web_stop_requested, external_stop
             );
-            shared_state.is_syncing.store(false, Ordering::SeqCst);
+            if !capture_faulted {
+                shared_state.set_sync_state(SyncState::Stopping, None);
+            }
+            release_capture(&mut capture);
+            shared_state
+                .capture_hardware
+                .store(false, Ordering::Relaxed);
+            shared_state.set_fps(0.0);
+            shared_state.set_light_update_fps(0.0);
+            light_update_count = 0;
+            light_update_window = tokio::time::Instant::now();
             pipeline_state = PipelineState::Paused;
 
             hue_status.request(None);
@@ -733,13 +780,30 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
             shared_state
                 .nanoleaf_connected
                 .store(false, Ordering::Relaxed);
+            if source_policy.source_paused() && source_policy.blocked() {
+                shared_state.set_sync_state(SyncState::UnsupportedSource, Some("Built-in apps and Home are not supported by this capture backend; select HDMI to resume.".into()));
+            } else if !capture_faulted {
+                shared_state.set_sync_state(SyncState::Paused, None);
+            }
 
             while running.load(Ordering::SeqCst) {
                 tokio::time::sleep(watchdog.pause_poll_period()).await;
                 pending_commands.receive(&mut command_rx);
+                source_policy.manual_request(pending_commands.manual_running.take());
                 watchdog.tick();
+                if last_source_poll.elapsed() >= Duration::from_secs(2) {
+                    last_source_poll = tokio::time::Instant::now();
+                    source_policy
+                        .observe(crate::capture_source::current_source().await.compatible());
+                }
+                if source_policy.source_paused() && source_policy.blocked() {
+                    shared_state.set_sync_state(SyncState::UnsupportedSource, Some("Built-in apps and Home are not supported by this capture backend; select HDMI to resume.".into()));
+                } else if source_policy.manually_stopped() && !capture_faulted {
+                    shared_state.set_sync_state(SyncState::Paused, None);
+                }
+                pending_commands.resume_fault_for_restart(capture_faulted);
                 if pending_commands.has_management_action()
-                    && pending_commands.desired_running != Some(true)
+                    && (pending_commands.desired_running != Some(true) || source_policy.blocked())
                 {
                     break;
                 }
@@ -753,17 +817,16 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                     last_tv_power_poll = tokio::time::Instant::now() - Duration::from_secs(2);
                 }
 
-                let requested_running = pending_commands.desired_running.take();
+                let mut requested_running = pending_commands.desired_running.take();
                 if capture_faulted {
-                    if requested_running != Some(true) {
+                    if requested_running != Some(true) && !source_policy.auto_resume() {
                         continue;
                     }
                     // A manual Start retries a fault; TV/app auto-resume must not loop on it.
-                    capture_faulted = false;
-                    capture_recovery = CaptureRecovery::default();
                     pending_commands.restart = true;
                 }
-                let mut start_requested = requested_running == Some(true);
+                let mut start_requested =
+                    requested_running == Some(true) || source_policy.auto_resume();
                 if auto_tv_power && last_tv_power_poll.elapsed() >= Duration::from_secs(2) {
                     last_tv_power_poll = tokio::time::Instant::now();
                     match tv_power::is_active().await {
@@ -771,6 +834,7 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                             shared_state.set_tv_power_state(state);
                             let active = state.unwrap();
                             if requested_running.is_none()
+                                && !source_policy.manually_stopped()
                                 && observed_tv_power == Some(false)
                                 && active
                             {
@@ -789,6 +853,8 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                     }
                 }
                 let app_reactivated = if !start_requested
+                    && !source_policy.manually_stopped()
+                    && !source_policy.blocked()
                     && requested_running != Some(false)
                     && hue_active
                     && hue_sync_enabled
@@ -807,7 +873,29 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                     false
                 };
 
-                if start_requested || app_reactivated {
+                // A Stop received during an awaited observation must beat auto-resume.
+                pending_commands.receive(&mut command_rx);
+                source_policy.manual_request(pending_commands.manual_running.take());
+                if pending_commands.reconfigure {
+                    break;
+                }
+                if let Some(latest) = pending_commands.desired_running.take() {
+                    requested_running = Some(latest);
+                    start_requested = latest;
+                }
+                if source_policy.blocked() {
+                    if start_requested {
+                        source_policy.pause_for_source();
+                    }
+                    continue;
+                }
+                if (start_requested || app_reactivated)
+                    && !source_policy.manually_stopped()
+                    && !(auto_tv_power
+                        && observed_tv_power == Some(false)
+                        && requested_running != Some(true))
+                {
+                    source_policy.resumed();
                     hue_status.request(None);
                     info!(
                         "Sync resume requested! Reactivating Hue & Nanoleaf streaming sessions..."
@@ -816,7 +904,18 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                         hue_reconnect.request(Some(&config));
                     }
 
-                    shared_state.is_syncing.store(true, Ordering::SeqCst);
+                    if !capture_faulted {
+                        shared_state.set_sync_state(SyncState::Starting, None);
+                    }
+                    if !pending_commands.restart {
+                        capture = create_capture(config.capture_width, config.capture_height);
+                    }
+                    shared_state
+                        .capture_hardware
+                        .store(capture.is_real_hardware(), Ordering::Relaxed);
+                    shared_state.set_fps(target_fps as f32);
+                    capture_retry.success();
+                    capture_recovery = CaptureRecovery::default();
                     pipeline_state = PipelineState::Running;
 
                     if nanoleaf_active && nanoleaf_sync_enabled {
@@ -1133,13 +1232,16 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
 
         if std::mem::take(&mut pending_commands.restart) {
             info!("Pipeline restart requested via Web UI. Re-initializing capture...");
-            drop(std::mem::replace(
-                &mut capture,
-                Box::new(MockCapture::new(
-                    config.capture_width,
-                    config.capture_height,
-                )),
-            ));
+            if source_policy.blocked() {
+                if !source_policy.manually_stopped() {
+                    source_policy.pause_for_source();
+                }
+                continue 'sync_loop;
+            }
+            if !capture_faulted {
+                shared_state.set_sync_state(SyncState::Stopping, None);
+            }
+            release_capture(&mut capture);
             shared_state
                 .capture_hardware
                 .store(false, Ordering::Relaxed);
@@ -1147,13 +1249,29 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                 break 'sync_loop;
             }
             pending_commands.receive(&mut command_rx);
-            if pending_commands.desired_running == Some(false) || pending_commands.reconfigure {
+            source_policy.manual_request(pending_commands.manual_running.take());
+            source_policy.observe(crate::capture_source::current_source().await.compatible());
+            last_source_poll = tokio::time::Instant::now();
+            pending_commands.receive(&mut command_rx);
+            source_policy.manual_request(pending_commands.manual_running.take());
+            if pending_commands.capture_restart_cancelled()
+                || source_policy.blocked()
+                || source_policy.manually_stopped()
+            {
+                if source_policy.blocked() && !source_policy.manually_stopped() {
+                    source_policy.pause_for_source();
+                }
                 continue 'sync_loop;
             }
             capture_faulted = false;
             capture_recovery = CaptureRecovery::default();
             capture_retry.success();
-            capture = create_capture(config.capture_width, config.capture_height);
+            if pipeline_state == PipelineState::Running {
+                shared_state.set_sync_state(SyncState::Starting, None);
+                capture = create_capture(config.capture_width, config.capture_height);
+            } else {
+                shared_state.set_sync_state(SyncState::Paused, None);
+            }
             shared_state
                 .capture_hardware
                 .store(capture.is_real_hardware(), Ordering::Relaxed);
@@ -1164,8 +1282,9 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
         }
 
         // In auto FPS mode, dynamically update cadence if TV source rate changed (e.g. film started)
-        if config.fps == 0 {
-            if let Some(new_fps) = detect_source_fps() {
+        if config.fps == 0 && last_source_fps_poll.elapsed() >= Duration::from_secs(2) {
+            last_source_fps_poll = tokio::time::Instant::now();
+            if let Some(new_fps) = detect_source_fps().await {
                 let clamped = new_fps.clamp(20.0, 60.0);
                 if (clamped - target_fps).abs() > 0.5 {
                     target_fps = clamped;
@@ -1191,6 +1310,10 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                 }
                 Err(error) => {
                     let delay = capture_retry.failure();
+                    shared_state.set_sync_state(
+                        SyncState::Recovering,
+                        Some(format!("Hardware capture unavailable: {error:#}")),
+                    );
                     warn!("Hardware capture unavailable ({error:#}); retrying in {delay:?}");
                 }
             }
@@ -1201,6 +1324,7 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
             Ok(frame) => {
                 if hardware_frame {
                     capture_recovery.frame_received(std::time::Instant::now());
+                    shared_state.set_sync_state(SyncState::Running, None);
                 }
                 let mut is_scene_cut = false;
 
@@ -1406,6 +1530,7 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                 }
             }
             Err(e) => {
+                shared_state.set_sync_state(SyncState::Recovering, Some(e.to_string()));
                 let delay = match capture_recovery.failed(&e) {
                     RecoveryAction::Retry => {
                         if !runtime::wait_for_capture_retry(frame_interval, &shutdown).await {
@@ -1423,6 +1548,7 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                             .capture_hardware
                             .store(false, Ordering::Relaxed);
                         capture_faulted = true;
+                        shared_state.set_sync_state(SyncState::Faulted, Some(e.to_string()));
                         pending_commands.desired_running = Some(false);
                         continue 'sync_loop;
                     }
@@ -1448,13 +1574,24 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                 }
                 watchdog.tick();
                 pending_commands.receive(&mut command_rx);
-                if pending_commands.desired_running == Some(false) || pending_commands.reconfigure {
+                source_policy.manual_request(pending_commands.manual_running.take());
+                source_policy.observe(crate::capture_source::current_source().await.compatible());
+                last_source_poll = tokio::time::Instant::now();
+                pending_commands.receive(&mut command_rx);
+                source_policy.manual_request(pending_commands.manual_running.take());
+                if pending_commands.capture_restart_cancelled()
+                    || source_policy.blocked()
+                    || source_policy.manually_stopped()
+                {
+                    if source_policy.blocked() && !source_policy.manually_stopped() {
+                        source_policy.pause_for_source();
+                    }
                     continue 'sync_loop;
                 }
 
                 // Auto-adapt to new source refresh rate if enabled
                 if config.fps == 0 {
-                    if let Some(new_fps) = detect_source_fps() {
+                    if let Some(new_fps) = detect_source_fps().await {
                         let clamped = new_fps.clamp(20.0, 60.0);
                         if (clamped - target_fps).abs() > 0.5 {
                             target_fps = clamped;
@@ -1493,6 +1630,14 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
             tokio::time::sleep(frame_interval - elapsed).await;
         }
     }
+
+    shared_state.set_sync_state(SyncState::Stopping, None);
+    release_capture(&mut capture);
+    shared_state
+        .capture_hardware
+        .store(false, Ordering::Relaxed);
+    shared_state.set_fps(0.0);
+    shared_state.set_light_update_fps(0.0);
 
     // Join the serial worker after invalidating every in-flight reconnect.
     drop(hue_dtls);

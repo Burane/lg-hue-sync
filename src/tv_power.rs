@@ -1,28 +1,12 @@
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
-use std::time::Duration;
-use tokio::process::Command;
-use tokio::time::timeout;
 
 const POWER_STATE_URI: &str = "luna://com.webos.service.tvpower/power/getPowerState";
 
 pub async fn is_active() -> Result<Option<bool>> {
-    let output = timeout(
-        Duration::from_millis(1500),
-        Command::new("/usr/bin/luna-send")
-            .kill_on_drop(true)
-            .args(["-n", "1", "-f", "-w", "1000", POWER_STATE_URI, "{}"])
-            .output(),
-    )
-    .await
-    .context("timed out querying webOS TV power state")??;
-
-    if !output.status.success() {
-        return Err(anyhow!("luna-send exited with {}", output.status));
-    }
-
-    let response: Value = serde_json::from_slice(&output.stdout)
-        .context("webOS TV power query returned invalid JSON")?;
+    let response = crate::luna::query(POWER_STATE_URI, "{}")
+        .await
+        .context("webOS TV power query failed")?;
     if response.get("returnValue") == Some(&Value::Bool(false)) {
         return Err(anyhow!("webOS TV power query failed"));
     }

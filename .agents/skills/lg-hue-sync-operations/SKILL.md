@@ -14,10 +14,12 @@ Read `AGENTS.md`, then the relevant guide:
 ## Invariants
 
 - Deploy only `armv7-unknown-linux-gnueabi`; never transfer a host binary.
-- Treat `webosbrew/native-toolchain` as the reference SDK, but use the documented Debian Buster build until the SDK passes the `getauxval`/`ring` gate.
+- Default `make build`/`make build-native` uses the macOS webOS SDK compiler with the extracted Buster sysroot after `make native-setup`, not its older libc/polyfills. Native v0.6.1 passed TV service/capture checks; require ELF/ABI/glibc checks for each artifact. `make build-docker` remains the explicit cached fallback and Linux CI path.
 - [`openlgtv/buildroot-nc4`](https://github.com/openlgtv/buildroot-nc4) underpins that SDK; consult [`webosbrew/webos-userland`](https://github.com/webosbrew/webos-userland/tree/main) and its [generated API reference](https://www.webosbrew.org/webos-userland/index.html) for capture headers, then verify symbols and behavior on the target firmware. See `docs/operations.md` for gates.
 - Prefer installed `ares-rs-*` aliases for launcher packaging/install and ordinary transfer; retain SSH for root service lifecycle.
 - Preserve the TV's paired `config.json` during updates.
+- Test source transitions: HDMI → built-in app/Home releases capture and reports `unsupported_source`; returning to HDMI resumes only source-paused sync. Manual Stop must survive input changes. Unknown input observations must not invent compatibility or DRM status.
+- Use the shared bounded Luna transport with stdin retained until reply. Closing stdin early makes this firmware's `luna-send` silently exit; validate a real read-only query on the TV rather than relying only on host fixtures.
 - Treat credentials, tokens, pins, IPs, and MACs as private.
 - Require explicit direction before TV writes, service restarts, Luna changes, autoroot, or light output.
 - Verify local/remote SHA-256, service state, and dashboard response after transfer.

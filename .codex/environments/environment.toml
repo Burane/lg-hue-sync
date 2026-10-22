@@ -20,6 +20,16 @@ icon = "tool"
 command = "make check build"
 
 [[actions]]
+name = "build-native-armv7"
+icon = "tool"
+command = "make build-native"
+
+[[actions]]
+name = "package-launcher"
+icon = "tool"
+command = "make package-app"
+
+[[actions]]
 name = "build-and-transfer-to-tv"
 icon = "tool"
 command = '''

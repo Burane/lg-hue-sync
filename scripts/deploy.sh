@@ -35,7 +35,7 @@ if [ -f "$BINARY" ] && $REUSE; then
     echo "[+] Using existing compiled binary at $BINARY ($(du -h "$BINARY" | cut -f1))"
     echo "    (Pass --reuse as 3rd argument only after verifying it matches this source tree)"
 else
-    echo "[*] Compiling release binary for $TARGET matching webOS 6.x glibc 2.28 in container..."
+    echo "[*] Compiling release binary for $TARGET using the default native SDK/Buster toolchain..."
     make build
 fi
 
@@ -45,6 +45,12 @@ if [ ! -f "$BINARY" ]; then
 fi
 
 echo "[+] Binary ready: $(du -h "$BINARY" | cut -f1)"
+
+# Fail local packaging before making any changes on the TV.
+IPK_PATH=""
+if [ -d "webos-app" ]; then
+    IPK_PATH="$(uv run scripts/package_ipk.py --print-path)"
+fi
 
 # 2. Check TV reachability and root status
 COMMON_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=5"
@@ -84,14 +90,10 @@ echo "[*] Provisioning Luna permissions for org.webosbrew.lg-hue-sync on TV..."
 ssh $SSH_OPTS root@"$TV_IP" "$REMOTE_DIR/provision_luna.sh local"
 
 # 4. Package and deploy webOS Application to Home Dashboard ribbon
-if [ -d "webos-app" ]; then
-    echo "[*] Packaging and installing webOS application for Home Dashboard..."
-    uv run scripts/package_ipk.py
-    IPK_PATH="$(find target -maxdepth 1 -name 'org.webosbrew.lg-hue-sync_*_all.ipk' -type f | sort | tail -1)"
-    if [ -n "$IPK_PATH" ]; then
-        scp $SCP_OPTS "$IPK_PATH" root@"$TV_IP":"/tmp/org.webosbrew.lg-hue-sync.ipk"
-        ssh $SSH_OPTS root@"$TV_IP" "luna-send -n 1 -f luna://com.webos.appInstallService/dev/install '{\"id\":\"org.webosbrew.lg-hue-sync\", \"ipkUrl\":\"/tmp/org.webosbrew.lg-hue-sync.ipk\", \"subscribe\":false}' || true"
-    fi
+if [ -n "$IPK_PATH" ]; then
+    echo "[*] Installing packaged webOS application for Home Dashboard..."
+    scp $SCP_OPTS "$IPK_PATH" root@"$TV_IP":"/tmp/org.webosbrew.lg-hue-sync.ipk"
+    ssh $SSH_OPTS root@"$TV_IP" "luna-send -n 1 -f luna://com.webos.appInstallService/dev/install '{\"id\":\"org.webosbrew.lg-hue-sync\", \"ipkUrl\":\"/tmp/org.webosbrew.lg-hue-sync.ipk\", \"subscribe\":false}' || true"
 fi
 
 # 5. Create persistent systemd unit & webosbrew init.d autostart hook

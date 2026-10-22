@@ -19,7 +19,7 @@ Native ambient-light synchronization for rooted LG webOS TVs. A Rust daemon capt
 ## Limits and safety
 
 - Root access is required. Rooting can void warranties or render a TV unusable; confirm model and firmware compatibility first.
-- DRM-protected native webOS apps may expose black capture surfaces. External HDMI playback is the reliable path for protected content.
+- Capture is HDMI-only: known built-in apps and Home automatically pause capture; returning to HDMI resumes it unless manually stopped. This input policy does not detect or bypass DRM. External HDMI playback is the supported path for protected content.
 - Hue decides how physical gradient segments are grouped into Entertainment channels. This project streams the selected area's returned channels; it does not fabricate more.
 - LG private capture APIs and community root methods are unsupported by LG and may change with firmware.
 
@@ -27,7 +27,7 @@ Check [cani.rootmy.tv](https://cani.rootmy.tv/) and [webOS Brew](https://github.
 
 ## Requirements
 
-- Development host with Rust, [cargo-nextest](https://nexte.st/docs/installation/pre-built-binaries/), Docker, `make`, SSH, and `uv`.
+- Development Mac with Rust/rustup, [cargo-nextest](https://nexte.st/docs/installation/pre-built-binaries/), webOS Brew native SDK, `make`, SSH, and `uv`. Docker is needed for one-time sysroot setup or the explicit fallback.
 - Rooted webOS TV with root SSH and compatible capture libraries.
 - Hue Bridge v2 and/or Nanoleaf 4D on the same LAN.
 
@@ -41,9 +41,9 @@ make build
 file target/armv7-unknown-linux-gnueabi/release/lg-hue-sync
 ```
 
-The canonical target build uses Debian Buster to stay within the LG C1/webOS 6 glibc ceiling. A macOS host build is useful for tests, but cannot run on the TV.
+The default target build uses the Mac webOS SDK compiler with a Buster sysroot to stay within the LG C1/webOS 6 glibc ceiling. It produces an ARM Linux binary; ordinary host Cargo builds produce Mac binaries for tests.
 
-The official community [webosbrew/native-toolchain](https://github.com/webosbrew/native-toolchain) remains the reference webOS SDK. It currently cannot link this Rust dependency graph because its libc lacks `getauxval`, required by Rust's supported ARM standard library and `ring`; see [docs/operations.md](docs/operations.md) for the re-evaluation gate.
+Run `make native-setup` once using the installed [webosbrew/native-toolchain](https://github.com/webosbrew/native-toolchain) and cached builder, then `make build` without Docker. `make build-docker` remains the explicit fallback and Linux CI path. Rust Ares powers `make package-app` and explicit-device launcher management. See [docs/operations.md](docs/operations.md) for setup, ABI gates and deployment boundaries.
 
 Apple Shortcuts can apply a dashboard preset over the trusted LAN with a `POST` request to `http://<tv-ip>:8088/api/presets/<name>`; see [docs/operations.md](docs/operations.md#apple-shortcuts-and-presets). Preset changes are live until saved.
 

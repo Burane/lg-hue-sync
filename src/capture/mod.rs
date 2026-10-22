@@ -96,6 +96,15 @@ pub trait ScreenCapture {
 pub use dile_vt::{detect_source_fps, DileVtCapture, MockCapture};
 pub use vtcapture::VtCapture;
 
+/// Drop the native owner before allowing another capture client to acquire the scaler.
+pub fn release_capture(capture: &mut Box<dyn ScreenCapture>) {
+    let (width, height) = capture.resolution();
+    drop(std::mem::replace(
+        capture,
+        Box::new(MockCapture::new(width, height)),
+    ));
+}
+
 /// Creates a screen capture instance, prioritizing libvtcapture (webOS 6.x / C1 OLED),
 /// falling back to dile_vt, and finally to MockCapture.
 pub fn create_capture(width: u32, height: u32) -> Box<dyn ScreenCapture> {
@@ -150,6 +159,35 @@ pub fn create_capture(width: u32, height: u32) -> Box<dyn ScreenCapture> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_drops_native_owner_once_and_preserves_resolution() {
+        struct OwnedCapture(std::rc::Rc<std::cell::Cell<u32>>);
+        impl ScreenCapture for OwnedCapture {
+            fn acquire_frame(&mut self) -> Result<CapturedFrame<'_>, CaptureError> {
+                unreachable!()
+            }
+            fn resolution(&self) -> (u32, u32) {
+                (16, 9)
+            }
+            fn is_real_hardware(&self) -> bool {
+                true
+            }
+        }
+        impl Drop for OwnedCapture {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let drops = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut capture: Box<dyn ScreenCapture> = Box::new(OwnedCapture(drops.clone()));
+        release_capture(&mut capture);
+        assert_eq!(drops.get(), 1);
+        assert!(!capture.is_real_hardware());
+        assert_eq!(capture.resolution(), (16, 9));
+        release_capture(&mut capture);
+        assert_eq!(drops.get(), 1);
+    }
 
     fn unavailable(code: i32) -> CaptureError {
         CaptureError::Unavailable(NativeCaptureError {

@@ -6,7 +6,7 @@
 
 - [ ] `make release-check`
 - [ ] Host formatting, tests, Clippy, and dashboard JavaScript checks
-- [ ] `make build` when runtime, dependencies, build, or packaging changed
+- [ ] `make build` (macOS native) or `make build-docker` (Linux/fallback) when runtime, dependencies, build, or packaging changed
 - [ ] No credentials, private device details, or populated `config.json`
 - [ ] AI assistance disclosed when used
 

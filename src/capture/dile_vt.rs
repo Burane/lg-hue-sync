@@ -637,25 +637,11 @@ pub fn create_capture(width: u32, height: u32) -> Box<dyn ScreenCapture> {
     }
 }
 
-pub fn detect_source_fps() -> Option<f64> {
-    if std::path::Path::new("/usr/bin/luna-send").exists() {
-        if let Ok(output) = std::process::Command::new("/usr/bin/luna-send")
-            .args([
-                "-n",
-                "1",
-                "luna://com.webos.service.tv.display/getVideoInfo",
-                "{}",
-            ])
-            .output()
-        {
-            if output.status.success() {
-                if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-                    return source_fps_from_video_info(&val);
-                }
-            }
-        }
-    }
-    None
+pub async fn detect_source_fps() -> Option<f64> {
+    let value = crate::luna::query("luna://com.webos.service.tv.display/getVideoInfo", "{}")
+        .await
+        .ok()?;
+    source_fps_from_video_info(&value)
 }
 
 fn source_fps_from_video_info(value: &serde_json::Value) -> Option<f64> {

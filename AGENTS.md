@@ -5,11 +5,13 @@ Rust daemon and LAN dashboard for screen-derived Philips Hue Entertainment and N
 ## Commands
 
 - Host gate: `cargo fmt --all -- --check && cargo nextest run --locked && cargo clippy --bin lg-hue-sync -- -D warnings`
-- Target build: `make build` (`armv7-unknown-linux-gnueabi`, cached `docker/Dockerfile.cross`, Debian Buster/glibc 2.28 baseline)
+- Target build: `make build` (`armv7-unknown-linux-gnueabi`, macOS webOS SDK compiler/Buster sysroot, glibc 2.28); prepare once with `make native-setup`. Explicit Docker fallback/Linux CI: `make build-docker` (`docker/Dockerfile.cross`).
 - Dependencies: `make deps-check`; update compatible versions with `make deps-update`, then run host and target gates
 - Reference SDK: `webosbrew/native-toolchain`; see `docs/operations.md` before changing the canonical build
 - Native API reference: `webosbrew/webos-userland` headers and generated docs; see `docs/architecture.md` and verify runtime symbols on the TV
 - Ares tools: `ares-rs-*` (official Rust v0.7.0 aliases) or existing Node `ares-*`
+- Launcher packaging: `make package-app`; app management requires `ARES_DEVICE=<registered-name>`. Daemon/service lifecycle stays on SSH. Packaging/build-script tests: `uv run python scripts/test_package_ipk.py` and `uv run python scripts/test_native_toolchain.py`.
+- Zig is experimental: use the pinned isolated command in `docs/operations.md`; ABI inspection alone does not replace TV validation or the Docker fallback.
 - Safe update: `make deploy-bin TV_IP=<tv-ip>`; preserve the paired TV `config.json`
 - First install: `./scripts/deploy.sh <tv-ip>`; root SSH must already work
 - Verify: `make status TV_IP=<tv-ip>` and `curl http://<tv-ip>:8088/api/status`
@@ -24,6 +26,8 @@ Rust daemon and LAN dashboard for screen-derived Philips Hue Entertainment and N
 - Verify deployment with local/remote SHA-256, service state, dashboard status, and—when claimed—physical output.
 - Hue v2 channel IDs and grouped gradient members are authoritative; never invent absent channels.
 - Hue and Nanoleaf remain independently controllable. Hue physical placement belongs to the Hue app.
+- Known non-HDMI foreground apps/Home must release capture and report `unsupported_source`; resume automatically on HDMI only when source-paused, never after manual Stop. Unknown observations preserve the last known policy; do not classify numeric native errors as DRM.
+- Use the bounded shared `src/luna.rs` query transport; hold stdin open until the reply because this TV's `luna-send` exits on EOF. Bound output/deadlines, kill and reap failed children; never use unbounded `.output()` for Luna calls.
 
 ## Pull-request review
 

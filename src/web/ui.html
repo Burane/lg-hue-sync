@@ -15,11 +15,9 @@
       --card-bg: #12141d;
       --card-border: #1e2230;
       --accent: #6366f1;
-      --accent-glow: rgba(99, 102, 241, 0.4);
+      --accent-text: #a5b4fc;
       --success: #10b981;
-      --success-glow: rgba(16, 185, 129, 0.4);
       --danger: #ef4444;
-      --danger-glow: rgba(239, 68, 68, 0.4);
       --text: #f3f4f6;
       --text-muted: #9ca3af;
       --button-bg: #1a1e2b;
@@ -28,7 +26,6 @@
       --field-bg: #111522;
       --track-bg: #222738;
       --range-border: #eaf3ff;
-      --range-halo: rgba(68, 160, 255, 0.16);
       --focus-ring: #a5b4fc;
       --selection-bg: rgba(99, 102, 241, 0.16);
       --selection-text: #d9ecff;
@@ -52,11 +49,9 @@
         --card-bg: #ffffff;
         --card-border: #d5dbe6;
         --accent: #4f46e5;
-        --accent-glow: rgba(79, 70, 229, 0.24);
+      --accent-text: #4f46e5;
         --success: #047857;
-        --success-glow: rgba(4, 120, 87, 0.2);
         --danger: #b91c1c;
-        --danger-glow: rgba(185, 28, 28, 0.2);
         --text: #171b26;
         --text-muted: #535d6e;
         --button-bg: #f2f4f8;
@@ -65,7 +60,6 @@
         --field-bg: #ffffff;
         --track-bg: #d5dbe6;
         --range-border: #ffffff;
-        --range-halo: rgba(79, 70, 229, 0.18);
         --focus-ring: #4338ca;
         --selection-bg: rgba(79, 70, 229, 0.12);
         --selection-text: #312e81;
@@ -90,11 +84,9 @@
       --card-bg: #ffffff;
       --card-border: #d5dbe6;
       --accent: #4f46e5;
-      --accent-glow: rgba(79, 70, 229, 0.24);
+      --accent-text: #4f46e5;
       --success: #047857;
-      --success-glow: rgba(4, 120, 87, 0.2);
       --danger: #b91c1c;
-      --danger-glow: rgba(185, 28, 28, 0.2);
       --text: #171b26;
       --text-muted: #535d6e;
       --button-bg: #f2f4f8;
@@ -103,7 +95,6 @@
       --field-bg: #ffffff;
       --track-bg: #d5dbe6;
       --range-border: #ffffff;
-      --range-halo: rgba(79, 70, 229, 0.18);
       --focus-ring: #4338ca;
       --selection-bg: rgba(79, 70, 229, 0.12);
       --selection-text: #312e81;
@@ -126,8 +117,8 @@
     .brand { display: flex; align-items: center; gap: 12px; }
     .header-actions { display:flex; align-items:center; gap:12px; margin-left:auto; }
     .theme-control { width:44px; height:44px; padding:0; border:1px solid var(--card-border); border-radius:9px; background:var(--field-bg); color:var(--text); font-size:1.4rem; cursor:pointer; }
-    .status-dot { width: 12px; height: 12px; border-radius: 50%; background: var(--danger); box-shadow: 0 0 10px var(--danger-glow); transition: all 0.3s; }
-    .status-dot.active { background: var(--success); box-shadow: 0 0 14px var(--success-glow); }
+    .status-dot { width: 12px; height: 12px; border-radius: 50%; background: var(--danger); transition: all 0.3s; }
+    .status-dot.active { background: var(--success); }
     h1 { font-size: 1.25rem; font-weight: 700; letter-spacing: -0.02em; }
     .subtitle { font-size: 0.8rem; color: var(--text-muted); }
     
@@ -139,7 +130,7 @@
       background: var(--button-bg); color: var(--text); border: 1px solid var(--card-border); text-align: left;
     }
     .power-btn.active {
-      background: var(--sync-bg); color: var(--sync-text); box-shadow: 0 0 20px var(--success-glow); border-color: var(--success);
+      background: var(--sync-bg); color: var(--sync-text); border-color: var(--success);
     }
     .main-switch-track { position: relative; flex: 0 0 76px; height: 42px; border: 2px solid var(--switch-track-border); border-radius: 99px; background: var(--switch-track-bg); transition: background .2s,border-color .2s; }
     .main-switch-track::after { content:""; position:absolute; top:4px; left:4px; width:30px; height:30px; border-radius:50%; background:var(--switch-thumb); box-shadow:0 2px 7px #0008; transition:transform .2s,background .2s; }
@@ -164,7 +155,7 @@
     .led-segment { flex: 1; transition: background 0.15s ease; }
     .tv-center-content {
       position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 2;
-      text-align: center; color: rgba(255,255,255,0.4); font-size: 0.85rem; pointer-events: none;
+      text-align: center; color: #b3b3b3; font-size: 0.85rem; pointer-events: none;
     }
 
     /* Hue Zones Overlay */
@@ -176,14 +167,14 @@
     }
     .hue-zone-label {
       display: block; width: max-content; max-width: 100%; padding: 2px 4px; overflow: hidden;
-      color: rgba(255,255,255,0.9); background: rgba(0,0,0,0.55); font-size: 0.58rem;
+      color: rgba(255,255,255,0.9); background: rgba(0,0,0,0.8); font-size: 0.58rem;
       font-weight: 700; line-height: 1.2; text-overflow: ellipsis; white-space: nowrap;
     }
 
     /* Control Sliders */
     .control-group { margin-bottom: 18px; }
     .control-header { display: flex; justify-content: space-between; font-size: 0.85rem; font-weight: 600; margin-bottom: 10px; }
-    .control-val { color: var(--accent); font-variant-numeric: tabular-nums; }
+    .control-val { color: var(--accent-text); font-variant-numeric: tabular-nums; }
     input[type="range"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
     input[type="range"] {
       width: 100%; height: 50px; border-radius: 999px; background: transparent; outline: none;
@@ -198,7 +189,7 @@
     }
     input[type="range"]::-webkit-slider-thumb {
       -webkit-appearance: none; width: 36px; height: 36px; margin-top: -11px; border: 3px solid var(--range-border);
-      border-radius: 50%; background: var(--accent); cursor: pointer; box-shadow: 0 0 0 5px var(--range-halo), 0 0 14px var(--accent-glow);
+      border-radius: 50%; background: var(--accent); cursor: pointer; box-shadow: 0 1px 3px #0006;
     }
     input[type="range"]::-moz-range-track { height:14px; border-radius:999px; background:var(--track-bg); }
     #advancedSection input[type="range"]::-moz-range-track {
@@ -207,7 +198,7 @@
         linear-gradient(var(--track-bg), var(--track-bg));
       background-size: 100% 5px, 100% 5px, 100% 100%; background-position: center; background-repeat: no-repeat; border-radius: 999px;
     }
-    input[type="range"]::-moz-range-thumb { width:30px; height:30px; border:3px solid var(--range-border); border-radius:50%; background:var(--accent); box-shadow:0 0 0 5px var(--range-halo),0 0 14px var(--accent-glow); }
+    input[type="range"]::-moz-range-thumb { width:30px; height:30px; border:3px solid var(--range-border); border-radius:50%; background:var(--accent); box-shadow:0 1px 3px #0006; }
     .tuning-grid { display:grid; grid-template-columns:1fr; gap:0 18px; }
     .accordion { padding:0; overflow:visible; }
     .accordion > summary { display:flex; align-items:center; justify-content:space-between; min-height:64px; padding:16px 20px; border-radius:16px; cursor:pointer; list-style:none; font-weight:750; }
@@ -231,7 +222,7 @@
     .preset-info:hover .info-tip,.preset-info[open] .info-tip,.preset-info:focus-within .info-tip,.restart-info:hover .info-tip,.restart-info[open] .info-tip,.restart-info:focus-within .info-tip { display:block; }
     .restart-info { position:relative; }
     .preset-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin: 10px 0 16px; }
-    .preset-btn { min-height: 42px; border: 1px solid var(--card-border); border-radius: 10px; background: var(--button-bg); color: var(--text); font-weight: 700; cursor: pointer; }
+    .preset-btn { min-height: 42px; padding: 8px 10px; border: 1px solid var(--card-border); border-radius: 10px; background: var(--button-bg); color: var(--text); font-weight: 700; cursor: pointer; }
     .preset-btn.active { border-color: var(--accent); background: var(--selection-bg); color: var(--selection-text); }
 
     /* Toggles */
@@ -248,7 +239,7 @@
 
     /* Stats Grid */
     .stats-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
-    .stat-box { background: var(--surface-inset); border-radius: 10px; padding: 12px; border: 1px solid var(--card-border); }
+    .stat-box { padding: 12px 0; border-bottom: 1px solid var(--card-border); }
     .stat-title { font-size: 0.7rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
     .stat-value { font-size: 0.95rem; font-weight: 700; margin-top: 4px; }
 
@@ -513,6 +504,7 @@
       input.style.setProperty('--tick-space', (100 / steps) + '%');
     });
     let isSyncing = false;
+    let syncRequested = false;
     let pollTimer = null;
 
     function setTheme(theme) {
@@ -624,6 +616,7 @@
 
     function updateUI(data) {
       isSyncing = data.is_syncing;
+      syncRequested = ['paused', 'faulted'].includes(data.pipeline_state) ? false : (isSyncing || (data.requested_running ?? false));
       const dot = document.getElementById('statusDot');
       const sub = document.getElementById('statusSubtitle');
       const btn = document.getElementById('toggleBtn');
@@ -637,11 +630,16 @@
         btnText.innerText = 'SCREEN SYNC ON';
       } else {
         dot.className = 'status-dot';
-        sub.innerText = 'TV ' + tvPower + ' · Sync paused. Ready to start.';
+        const state = data.pipeline_state || 'paused';
+        sub.innerText = 'TV ' + tvPower + ' · ' + (state === 'unsupported_source'
+          ? 'Paused: built-in apps and Home are unsupported; waiting for HDMI'
+          : state + (data.last_error ? ': ' + data.last_error : ''));
         btn.className = 'power-btn';
         btnText.innerText = 'SCREEN SYNC OFF';
       }
-      btn.setAttribute('aria-checked', String(isSyncing));
+      btn.className = syncRequested ? 'power-btn active' : 'power-btn';
+      btnText.innerText = syncRequested ? 'STOP SCREEN SYNC' : 'START SCREEN SYNC';
+      btn.setAttribute('aria-checked', String(syncRequested));
 
       document.getElementById('statHue').innerText = data.hue_connected ? 'Connected @ ' + data.hue_bridge_ip : 'Disconnected';
       document.getElementById('statNanoleaf').innerText = data.nanoleaf_connected ? 'Connected @ ' + data.nanoleaf_ip + ' (40 Panels)' : (data.nanoleaf_ip ? 'Configured @ ' + data.nanoleaf_ip + ' · Disconnected' : 'Disconnected');
@@ -687,7 +685,7 @@
       }
       document.getElementById('calibrationStatus').innerText = data.calibration_pattern
         ? 'Pattern active: ' + data.calibration_pattern + '. Expected RGB values are sent directly to Hue and Nanoleaf.'
-        : 'Live video sync active.';
+        : (isSyncing ? 'Live video sync active.' : 'Live video sync inactive.');
       updateHueZones(data.hue_zones, data.hue_colors);
 
       // Update Nanoleaf preview LED segments
@@ -722,7 +720,7 @@
     }
 
     async function toggleSync() {
-      const endpoint = isSyncing ? '/api/stop' : '/api/start';
+      const endpoint = syncRequested ? '/api/stop' : '/api/start';
       try {
         await fetch(endpoint, { method: 'POST' });
         pollStatus();
@@ -994,7 +992,7 @@
             if (!outputs.includes(output) || typeof enabled !== 'boolean') throw new Error('Invalid sync output request.');
             const labels = { screen: 'screen sync', hue: 'Hue Entertainment', nanoleaf: 'Nanoleaf 4D' };
             const checkbox = output === 'hue' ? document.getElementById('toggleHueSync') : output === 'nanoleaf' ? document.getElementById('toggleNanoleafSync') : null;
-            const current = output === 'screen' ? isSyncing : checkbox.checked;
+            const current = output === 'screen' ? syncRequested : checkbox.checked;
             if (current === enabled) return { changed: false, output, enabled };
             if (!window.confirm(`${enabled ? 'Enable' : 'disable'} ${labels[output]} now?`)) return { changed: false, cancelled: true };
             if (output === 'screen') {

@@ -12,9 +12,64 @@ pub enum PipelineState {
     Paused,
 }
 
+pub struct CaptureSourcePolicy {
+    compatible: Option<bool>,
+    source_paused: bool,
+    manually_stopped: bool,
+}
+
+impl CaptureSourcePolicy {
+    pub fn new(compatible: Option<bool>, requested: bool) -> Self {
+        Self {
+            compatible,
+            source_paused: compatible == Some(false) && requested,
+            manually_stopped: false,
+        }
+    }
+
+    pub fn observe(&mut self, compatible: Option<bool>) {
+        if compatible.is_some() {
+            self.compatible = compatible;
+        }
+    }
+
+    pub fn manual_request(&mut self, requested: Option<bool>) {
+        if let Some(requested) = requested {
+            self.manually_stopped = !requested;
+            if !requested {
+                self.source_paused = false;
+            } else if self.blocked() {
+                self.source_paused = true;
+            }
+        }
+    }
+
+    pub fn blocked(&self) -> bool {
+        self.compatible == Some(false)
+    }
+    pub fn manually_stopped(&self) -> bool {
+        self.manually_stopped
+    }
+    pub fn source_paused(&self) -> bool {
+        self.source_paused
+    }
+    pub fn pause_for_source(&mut self) {
+        if !self.manually_stopped {
+            self.source_paused = true;
+        }
+    }
+    pub fn auto_resume(&self) -> bool {
+        self.source_paused && !self.blocked() && !self.manually_stopped
+    }
+    pub fn resumed(&mut self) {
+        self.source_paused = false;
+    }
+}
+
 #[derive(Default)]
 pub struct PendingCommands {
     pub desired_running: Option<bool>,
+    pub manual_running: Option<bool>,
     pub restart: bool,
     pub reconfigure: bool,
     pub sync_bridge: bool,
@@ -31,8 +86,14 @@ impl PendingCommands {
     pub fn receive(&mut self, receiver: &mut mpsc::Receiver<ControlCommand>) {
         while let Ok(command) = receiver.try_recv() {
             match command {
-                ControlCommand::Start => self.desired_running = Some(true),
-                ControlCommand::Stop => self.desired_running = Some(false),
+                ControlCommand::Start => {
+                    self.desired_running = Some(true);
+                    self.manual_running = Some(true);
+                }
+                ControlCommand::Stop => {
+                    self.desired_running = Some(false);
+                    self.manual_running = Some(false);
+                }
                 ControlCommand::Restart => self.restart = true,
                 ControlCommand::Reconfigure => self.reconfigure = true,
                 ControlCommand::SyncBridge => self.sync_bridge = true,
@@ -52,6 +113,16 @@ impl PendingCommands {
 
     pub fn take_stop_if_running(&mut self, state: PipelineState) -> bool {
         state == PipelineState::Running && self.desired_running.take() == Some(false)
+    }
+
+    pub fn resume_fault_for_restart(&mut self, faulted: bool) {
+        if faulted && self.restart && self.desired_running != Some(false) {
+            self.desired_running = Some(true);
+        }
+    }
+
+    pub fn capture_restart_cancelled(&self) -> bool {
+        self.desired_running == Some(false) || self.reconfigure
     }
 }
 
@@ -199,6 +270,31 @@ mod tests {
         assert!(pending.has_management_action());
     }
 
+    #[tokio::test]
+    async fn fault_restart_resumes_without_overriding_an_explicit_stop() {
+        let mut pending = PendingCommands {
+            restart: true,
+            ..PendingCommands::default()
+        };
+        pending.resume_fault_for_restart(false);
+        assert_eq!(pending.desired_running, None);
+        pending.resume_fault_for_restart(true);
+        assert_eq!(pending.desired_running, Some(true));
+        assert!(!pending.capture_restart_cancelled());
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender.send(ControlCommand::Stop).await.unwrap();
+        // Commands received during the restart delay must cancel capture recreation too.
+        pending.receive(&mut receiver);
+        assert!(pending.capture_restart_cancelled());
+        pending.desired_running = Some(false);
+        pending.resume_fault_for_restart(true);
+        assert_eq!(pending.desired_running, Some(false));
+        assert!(pending.capture_restart_cancelled());
+        pending.desired_running = None;
+        pending.reconfigure = true;
+        assert!(pending.capture_restart_cancelled());
+    }
+
     #[test]
     fn paused_start_request_survives_outer_command_check() {
         let mut pending = PendingCommands {
@@ -220,5 +316,57 @@ mod tests {
         retry.success();
         assert!(retry.ready());
         assert_eq!(retry.failure(), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn source_pause_retains_unknown_policy_and_resumes_hdmi_without_rearming_faults() {
+        let mut policy = CaptureSourcePolicy::new(Some(false), true);
+        assert!(policy.blocked());
+        assert!(policy.source_paused());
+        assert!(!policy.auto_resume());
+        policy.observe(None);
+        assert!(policy.blocked());
+        policy.observe(Some(true));
+        assert!(policy.auto_resume());
+        policy.resumed();
+        assert!(!policy.auto_resume());
+        policy.observe(None);
+        assert!(!policy.blocked());
+        policy.observe(Some(false));
+        assert!(!policy.auto_resume());
+        policy.pause_for_source();
+        policy.observe(Some(true));
+        assert!(policy.auto_resume());
+        policy.resumed();
+        // A later capture fault or Hue/TV pause is not a source pause.
+        assert!(!policy.auto_resume());
+    }
+
+    #[tokio::test]
+    async fn manual_stop_and_queued_restart_cannot_reinitialize_an_unsupported_source() {
+        let mut policy = CaptureSourcePolicy::new(Some(false), true);
+        let (sender, mut receiver) = mpsc::channel(2);
+        sender.send(ControlCommand::Restart).await.unwrap();
+        sender.send(ControlCommand::Stop).await.unwrap();
+        let mut pending = PendingCommands::default();
+        pending.receive(&mut receiver);
+        policy.manual_request(pending.manual_running.take());
+        assert!(pending.restart);
+        assert!(policy.blocked());
+        assert!(policy.manually_stopped());
+        assert!(!policy.source_paused());
+        assert!(pending.capture_restart_cancelled());
+        policy.observe(Some(true));
+        assert!(!policy.auto_resume());
+        policy.observe(Some(false));
+        sender.send(ControlCommand::Start).await.unwrap();
+        pending.receive(&mut receiver);
+        policy.manual_request(pending.manual_running.take());
+        assert!(policy.blocked());
+        assert!(policy.source_paused());
+        assert!(!policy.manually_stopped());
+        assert!(!policy.auto_resume());
+        policy.observe(Some(true));
+        assert!(policy.auto_resume());
     }
 }

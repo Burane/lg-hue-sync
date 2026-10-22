@@ -7,11 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-22
+
+### Added
+- Automatically pause capture on known built-in apps/Home and retry when HDMI returns, while preserving manual Stop. Show an explicit unsupported-input state instead of repeated driver initialization attempts.
+- Add macOS-native ARMv7 cross-builds using the webOS Brew compiler and a Buster/glibc 2.28 sysroot bootstrapped once from the cached builder. Validate ELF class, endianness, ARM EABI5 soft-float ABI, loader and glibc requirements before atomic artifact replacement.
+- Add Rust Ares launcher packaging and explicit-device install, launch and app-list commands, preserving the Homebrew manifest and selecting the exact current package instead of a stale filename.
+- Expose requested sync state, actual lifecycle state, readiness and capture failures separately; release capture resources before reporting stopped and show lifecycle transitions in the dashboard.
+- Add packaging and native-build safety tests, Codex build/package actions, and an isolated cargo-zigbuild experiment with verified ARM/glibc output.
+
+### Changed
+- Make `make build` use the native macOS toolchain after successful TV service/capture validation. Keep `make build-docker` as the explicit fallback and Linux CI path; separate native and Docker toolchain update commands.
+- Remove unused hard-float Cross/Cargo settings; preserve `armv7-unknown-linux-gnueabi` and the glibc 2.28 ceiling.
+- Improve dashboard spacing, contrast and status presentation while keeping Glasshouse and LG Hue Sync separately owned.
+- Package the launcher before full deployment mutates the TV. Keep paired configuration, checksum verification and a recoverable previous daemon binary.
+
 ### Fixed
+- Keep Luna query stdin open until the asynchronous response arrives; bound reply size and process lifetime, share transport across source/power/video queries, and limit source frame-rate polling to once every two seconds.
+- Preserve Faulted/error state when an explicit Stop cancels a capture Restart, including commands received during the restart delay.
 - Run periodic Hue Bridge status polling in a separate worker, reject superseded results, and wait for stop cleanup before checking for app-driven resume.
 - Move Hue reconnect and session cleanup to a serial background worker; discard superseded results and keep Nanoleaf and control processing running while Hue reconnects.
 - Reject malformed Hue client keys without UTF-8 slicing panics, and share a five-second DTLS handshake deadline across retries and socket operations.
 - Bound Nanoleaf pairing requests, response bodies, polling delays and panel-layout retrieval by the remaining pairing deadline.
+
+### Validation
+- Native v0.7.0 passed a live HDMI → app/Home → HDMI transition: hardware capture released and both rates reached zero on the unsupported source, then 60 FPS hardware capture resumed automatically and the error cleared. Binary SHA-256 matched and paired configuration stayed unchanged; all 89 Rust tests and packaging/build safety tests passed.
+- A preliminary native v0.6.1 build passed TV binary checksum, unchanged configuration, dashboard and service checks, with zero restarts, 320x180/60 FPS hardware capture, and Hue/Nanoleaf connected. Subsequent built-in app tests motivated the explicit input policy. Physical lighting quality was not measured.
+- The Zig candidate passed local ELF/ABI/glibc inspection only; it was not deployed. Published daemon assets are built by the Docker CI fallback and are not the TV-tested native artifact. Launcher-only IPKs and Homebrew manifests remain unpublished.
 
 ## [0.6.1] - 2026-10-08
 
