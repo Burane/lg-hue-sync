@@ -5,26 +5,21 @@ use anyhow::{Result, anyhow};
 // -----------------------------------------------------------------------------
 
 /// Shared library exposing the histogram capture API on webOS 25 (2025+ models).
-#[allow(dead_code)]
 pub const LIBVTCAPTURE_PATH: &str = "/usr/lib/libvtcapture.so.1";
 
 /// Zone counts for the four native histogram presets: [16, 16, 16, 14].
-#[allow(dead_code)]
 pub const ZONES_PER_PRESET: [usize; 4] = [16, 16, 16, 14];
 
 /// Presumed zone arrangement within a preset; row-major hypothesis, to be
 /// validated on-device before it is used for light placement.
-#[allow(dead_code)]
 pub const ZONE_GRID: (u32, u32) = (4, 4);
 
 /// Native per-entry stride observed in the histogram dump:
 /// 4-byte zone index followed by 1536 bytes of channel data.
-#[allow(dead_code)]
 pub const ENTRY_SIZE: usize = 0x604;
 
 /// One histogram zone as laid out by the native dump.
 #[repr(C)]
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VtHistogramEntry {
     /// Zone index reported by the driver; must equal the entry's position in the buffer.
@@ -39,12 +34,10 @@ pub struct VtHistogramEntry {
 
 /// Host-side staging buffer whose layout matches the native histogram dump,
 /// safe to hand to the driver as a `*mut VtHistogramEntry` array.
-#[allow(dead_code)]
 pub struct HistogramBuffer {
     entries: Vec<VtHistogramEntry>,
 }
 
-#[allow(dead_code)]
 impl HistogramBuffer {
     /// Allocates a zeroed buffer with `zones` entries.
     pub fn new(zones: usize) -> Self {
@@ -59,11 +52,15 @@ impl HistogramBuffer {
         }
     }
 
-    /// Writes each entry's position into its `index` field, establishing the
-    /// expected baseline before the driver fills the buffer.
+    /// Resets every entry to the pre-fill baseline: the driver's expected
+    /// position in `index` and an all-zero channel payload. The buffer is
+    /// reused across frames, so a partial or failed fill must not leave
+    /// stale channel bytes behind — they would masquerade as fresh data and
+    /// `is_wholly_absent` could never fire again after the first good frame.
     pub fn prefill_indices(&mut self) {
         for (position, entry) in self.entries.iter_mut().enumerate() {
             entry.index = position as i32;
+            entry.channels = [0; 1536];
         }
     }
 
@@ -184,5 +181,30 @@ mod tests {
         assert!(buffer.is_wholly_absent());
         buffer.entries[2].channels[1535] = 1;
         assert!(!buffer.is_wholly_absent());
+    }
+
+    #[test]
+    fn prefill_indices_resets_a_dirty_buffer_to_the_baseline() {
+        let mut buffer = HistogramBuffer::new(ZONES_PER_PRESET[0]);
+        // Dirty the buffer the way a previous frame's fill would leave it:
+        // stale channel bytes and a clobbered index.
+        buffer.entries[0].channels[0] = 0xFF;
+        buffer.entries[15].channels[1535] = 7;
+        buffer.entries[3].index = 99;
+
+        buffer.prefill_indices();
+
+        for i in 0..buffer.zones() {
+            let entry = buffer.entry(i);
+            assert_eq!(entry.index, i as i32, "indices must be sequential");
+            assert!(
+                entry.channels.iter().all(|&byte| byte == 0),
+                "entry {i} channels must be fully zeroed"
+            );
+        }
+        assert!(
+            buffer.is_wholly_absent(),
+            "prefill must restore the wholly-absent baseline"
+        );
     }
 }

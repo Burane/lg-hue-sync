@@ -45,9 +45,11 @@ pub fn zone_summary(entry: &VtHistogramEntry) -> (u64, u64, u64) {
 }
 
 /// Same as `zone_summary` under the u16 interpretation: each block is 256
-/// little-endian `u16` bins. Consumed by `zone_to_rgb` while u8-vs-u16 bin
-/// semantics await on-device confirmation (u8 vs u16 is settled by the probe's
-/// raw first-byte dumps).
+/// little-endian `u16` bins. Diagnostic counterpart of `zone_summary` for
+/// the u8-vs-u16 bin disambiguation; its former consumer `zone_to_rgb` now
+/// uses the weighted-mean helpers instead, and u8-vs-u16 is settled by the
+/// on-device probe (Task 7).
+#[allow(dead_code)]
 pub fn zone_summary_u16(entry: &VtHistogramEntry) -> (u64, u64, u64) {
     (
         u16_block_sum(&entry.channels[0..512]),
@@ -86,7 +88,8 @@ fn bins_argmax(bins: impl Iterator<Item = u64>) -> (usize, u64) {
 }
 
 /// Count-weighted mean bin level: `sum(i * count[i]) / sum(count[i])`, 0.0
-/// when every count is zero.
+/// when every count is zero. The one implementation of the statistic, shared
+/// by the probe diagnostics and `zone_to_rgb` through the two adapters below.
 fn bins_weighted_mean(bins: impl Iterator<Item = u64>) -> f64 {
     let mut weighted = 0u64;
     let mut total = 0u64;
@@ -107,7 +110,7 @@ fn u8_argmax(block: &[u8]) -> (usize, u64) {
 }
 
 /// `bins_weighted_mean` over the block's 256 u8 bins.
-fn u8_weighted_mean(block: &[u8]) -> f64 {
+pub(crate) fn u8_weighted_mean(block: &[u8]) -> f64 {
     bins_weighted_mean(block.iter().map(|&byte| u64::from(byte)))
 }
 
@@ -117,7 +120,7 @@ fn u16_argmax(block: &[u8]) -> (usize, u64) {
 }
 
 /// `bins_weighted_mean` over the block's 256 little-endian u16 bins.
-fn u16_weighted_mean(block: &[u8]) -> f64 {
+pub(crate) fn u16_weighted_mean(block: &[u8]) -> f64 {
     bins_weighted_mean(u16_bins(block))
 }
 

@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 use tracing::{info, warn};
 
-use super::histogram_probe::{REINIT, policy_trampoline, zone_summary, zone_summary_u16};
+use super::histogram_probe::{REINIT, policy_trampoline, u8_weighted_mean, u16_weighted_mean};
 use super::histogram_types::{
     HistogramBuffer, LIBVTCAPTURE_PATH, VtHistogramEntry, ZONE_GRID, ZONES_PER_PRESET,
 };
@@ -36,32 +36,47 @@ pub const BIN_LAYOUT: BinLayout = BinLayout::U8x512;
 /// Channel-block index to (R, G, B) mapping (Task 7 finalizes).
 pub const CHANNEL_ORDER: (usize, usize, usize) = (0, 1, 2);
 
-/// Maximum per-channel sum for a layout: bins x maximum bin value.
-fn max_channel_sum(layout: BinLayout) -> f64 {
-    match layout {
-        BinLayout::U8x512 => 512.0 * 255.0,
-        BinLayout::U16x256 => 256.0 * 65535.0,
-    }
-}
-
-/// Converts one histogram zone into an 8-bit (R, G, B) colour by summing each
-/// channel block under `layout` and normalizing against the maximum possible
-/// count, saturating at 255. `order` maps channel blocks to (R, G, B).
+/// Converts one histogram zone into an 8-bit (R, G, B) colour from each
+/// channel block's count-weighted mean bin level, saturating at 255.
+/// `order` maps channel blocks to (R, G, B).
+///
+/// The statistic is the *level* a zone's energy sits at —
+/// `sum(i·count[i]) / sum(count[i])`, 0.0 for an all-zero block, with the
+/// one shared implementation in `histogram_probe` — not a sum of counts: a
+/// sum measures how many pixels reported, which grows with scene brightness
+/// only incidentally and says nothing about where in the 0..bins range the
+/// counts landed. The mean level maps to 0-255 per layout: `U8x512` levels
+/// span 0..=511 and scale by 255/511 (dividing by the top level before
+/// scaling keeps the endpoints exact), `U16x256` levels already span
+/// 0..=255 and pass through unscaled. Example for `U8x512`: ten counts in
+/// bin 5 and five in bin 100 give a mean of (5·10 + 100·5)/15 = 36.67,
+/// rendered as 36.67·(255/511) = 18.3 → 18.
 pub fn zone_to_rgb(
     entry: &VtHistogramEntry,
     layout: BinLayout,
     order: (usize, usize, usize),
 ) -> (u8, u8, u8) {
-    let (c0, c1, c2) = match layout {
-        BinLayout::U8x512 => zone_summary(entry),
-        BinLayout::U16x256 => zone_summary_u16(entry),
+    let blocks = (
+        &entry.channels[0..512],
+        &entry.channels[512..1024],
+        &entry.channels[1024..1536],
+    );
+    let levels = match layout {
+        BinLayout::U8x512 => [
+            u8_weighted_mean(blocks.0),
+            u8_weighted_mean(blocks.1),
+            u8_weighted_mean(blocks.2),
+        ],
+        BinLayout::U16x256 => [
+            u16_weighted_mean(blocks.0),
+            u16_weighted_mean(blocks.1),
+            u16_weighted_mean(blocks.2),
+        ],
     };
-    let scale = 255.0 / max_channel_sum(layout);
-    let channels = [
-        ((c0 as f64) * scale).min(255.0) as u8,
-        ((c1 as f64) * scale).min(255.0) as u8,
-        ((c2 as f64) * scale).min(255.0) as u8,
-    ];
+    let channels = levels.map(|level| match layout {
+        BinLayout::U8x512 => (level / 511.0 * 255.0).min(255.0) as u8,
+        BinLayout::U16x256 => level.min(255.0) as u8,
+    });
     (channels[order.0], channels[order.1], channels[order.2])
 }
 
@@ -214,6 +229,11 @@ impl<L: HistogramLib> HistogramCaptureImpl<L> {
             "bad preset {preset}: histogram presets are 0..{}",
             ZONES_PER_PRESET.len()
         );
+        // A dropped session may have left an unconsumed policy request; a
+        // freshly armed session must not inherit it, or the first
+        // acquire_frame would tear down the session just created. Cleared
+        // before init so a policy event arriving during arming is preserved.
+        REINIT.store(false, Ordering::SeqCst);
         let handle = lib.init();
         if handle.is_null() {
             return Err(anyhow::Error::new(NativeCaptureError {
@@ -421,6 +441,12 @@ mod tests {
         init_handles: VecDeque<*mut c_void>,
         preset_rc: i32,
         get_rc: i32,
+        /// Per-call `get` result codes, consumed front to back; exhausted
+        /// scripts fall back to `get_rc`.
+        get_rcs: VecDeque<i32>,
+        /// Buffer fills for successive successful `get` calls, consumed front
+        /// to back; exhausted scripts fall back to `fill`.
+        fills: VecDeque<Box<dyn FnMut(&mut VtHistogramEntry)>>,
         zones: usize,
         fill: Option<Box<dyn FnMut(&mut VtHistogramEntry)>>,
     }
@@ -434,6 +460,8 @@ mod tests {
                 init_handles: VecDeque::new(),
                 preset_rc: 0,
                 get_rc: 0,
+                get_rcs: VecDeque::new(),
+                fills: VecDeque::new(),
                 zones: TEST_ZONES,
                 fill: None,
             }
@@ -460,6 +488,20 @@ mod tests {
             self
         }
 
+        /// Result codes for successive `get` calls; exhausted scripts fall
+        /// back to `get_rc`.
+        fn with_get_rcs(mut self, rcs: Vec<i32>) -> Self {
+            self.get_rcs = rcs.into();
+            self
+        }
+
+        /// Buffer fills for successive successful `get` calls; exhausted
+        /// scripts fall back to `fill`.
+        fn with_fills(mut self, fills: Vec<Box<dyn FnMut(&mut VtHistogramEntry)>>) -> Self {
+            self.fills = fills.into();
+            self
+        }
+
         fn with_fill(mut self, fill: impl FnMut(&mut VtHistogramEntry) + 'static) -> Self {
             self.fill = Some(Box::new(fill));
             self
@@ -483,23 +525,37 @@ mod tests {
 
         fn get(&mut self, _handle: *mut c_void, buf: *mut VtHistogramEntry) -> i32 {
             self.calls.borrow_mut().push("get");
-            if self.get_rc == 0 {
-                if let Some(fill) = self.fill.as_mut() {
-                    // SAFETY: `buf` points at the capture's HistogramBuffer,
-                    // allocated with exactly `self.zones` entries and valid for
-                    // the duration of this single-threaded test call.
-                    let entries = unsafe { std::slice::from_raw_parts_mut(buf, self.zones) };
-                    for entry in entries.iter_mut() {
-                        fill(entry);
-                    }
+            let rc = self.get_rcs.pop_front().unwrap_or(self.get_rc);
+            if rc == 0 {
+                let mut scripted = self.fills.pop_front();
+                if let Some(fill) = scripted.as_mut() {
+                    run_fill(fill, buf, self.zones);
+                } else if let Some(fill) = self.fill.as_mut() {
+                    run_fill(fill, buf, self.zones);
                 }
             }
-            self.get_rc
+            rc
         }
 
         fn finalize(&mut self, _handle: *mut c_void) -> i32 {
             self.calls.borrow_mut().push("finalize");
             0
+        }
+    }
+
+    /// Runs one scripted fill against the capture's buffer, mirroring a
+    /// driver that writes `zones` entries.
+    fn run_fill(
+        fill: &mut dyn FnMut(&mut VtHistogramEntry),
+        buf: *mut VtHistogramEntry,
+        zones: usize,
+    ) {
+        // SAFETY: `buf` points at the capture's HistogramBuffer, allocated
+        // with exactly `zones` entries and valid for the duration of this
+        // single-threaded test call.
+        let entries = unsafe { std::slice::from_raw_parts_mut(buf, zones) };
+        for entry in entries {
+            fill(entry);
         }
     }
 
@@ -650,7 +706,8 @@ mod tests {
     fn canvas_geometry_maps_zone_five_to_its_grid_rect() {
         let lib = FakeHistogramLib::new().with_fill(|entry| {
             if entry.index == 5 {
-                entry.channels[..512].fill(0xFF);
+                // All counts at the top bin: mean level 511 -> 255, pure red.
+                entry.channels[511] = 0xFF;
             }
         });
         let mut capture = capture(lib);
@@ -687,29 +744,115 @@ mod tests {
         assert_eq!(red, 80 * 45, "exactly the rect's pixels may be red");
     }
 
-    // 8. zone_to_rgb normalization and saturation.
+    // 8. zone_to_rgb: count-weighted mean level, scaling, and saturation.
     #[test]
-    fn zone_to_rgb_normalizes_and_saturates() {
+    fn zone_to_rgb_uses_weighted_mean_level() {
         let mut entry = VtHistogramEntry {
             index: 0,
             channels: [0; 1536],
         };
 
-        // Block 0 all bytes 1: 255*512*1 / (512*255) = 1.
-        entry.channels[..512].fill(1);
+        // U8x512 review example: ten counts at bin 5 and five at bin 100
+        // -> mean (5·10 + 100·5)/15 = 36.67 -> 36.67·255/511 = 18.3 -> 18.
+        entry.channels[5] = 10;
+        entry.channels[100] = 5;
         assert_eq!(
             zone_to_rgb(&entry, BinLayout::U8x512, CHANNEL_ORDER),
-            (1, 0, 0)
+            (18, 0, 0)
         );
 
-        // Scaled channel order mapping: (2, 1, 0) turns the red zone blue.
-        assert_eq!(zone_to_rgb(&entry, BinLayout::U8x512, (2, 1, 0)), (0, 0, 1));
+        // Blocks with zero counts carry no level: the untouched channels
+        // stay at 0. Channel order (2, 1, 0) turns the red zone blue.
+        assert_eq!(
+            zone_to_rgb(&entry, BinLayout::U8x512, (2, 1, 0)),
+            (0, 0, 18)
+        );
 
-        // Saturation: a fully-saturated block clamps at 255.
-        entry.channels[..512].fill(0xFF);
+        // U16x256 means already span 0..=255 and pass through unscaled:
+        // bin 100 ×10 and bin 200 ×5 -> mean (100·10 + 200·5)/15 = 133.33.
+        let mut u16_entry = VtHistogramEntry {
+            index: 0,
+            channels: [0; 1536],
+        };
+        u16_entry.channels[200..202].copy_from_slice(&10u16.to_le_bytes());
+        u16_entry.channels[400..402].copy_from_slice(&5u16.to_le_bytes());
+        assert_eq!(
+            zone_to_rgb(&u16_entry, BinLayout::U16x256, CHANNEL_ORDER),
+            (133, 0, 0)
+        );
+
+        // Saturation: every count at the top bin puts the mean at the top
+        // level (511), which scales to exactly 255.
+        entry.channels[..512].fill(0);
+        entry.channels[511] = 0xFF;
         assert_eq!(
             zone_to_rgb(&entry, BinLayout::U8x512, CHANNEL_ORDER),
             (255, 0, 0)
+        );
+    }
+
+    // 9. A failed get (rc != 0) must leave no stale colours behind.
+    #[test]
+    fn failed_get_leaves_no_stale_colors_in_the_next_frame() {
+        let lib = FakeHistogramLib::new()
+            .with_get_rcs(vec![0, 2, 0, 0])
+            .with_fills(vec![
+                // Frame 1: a real payload with a high green level everywhere
+                // (bin 88 of block 1), so stale bytes would actually show.
+                Box::new(|entry: &mut VtHistogramEntry| entry.channels[600] = 0xFF),
+                // The failed get in between writes nothing. The next success
+                // carries zero-level data (all counts in bin 0): fully black
+                // unless a byte of frame 1 survived in the reused buffer.
+                Box::new(|entry: &mut VtHistogramEntry| entry.channels[0] = 1),
+            ]);
+        let mut capture = capture(lib);
+
+        let first = capture.acquire_frame().expect("first frame");
+        assert!(
+            first.data.chunks_exact(4).any(|px| px[1] != 0),
+            "frame 1 must carry colour for stale data to matter"
+        );
+
+        match frame_error(&mut capture) {
+            CaptureError::Unavailable(native) => {
+                assert_eq!(native.operation, "get_histogram");
+                assert_eq!(native.code, 2);
+            }
+            other => panic!("expected Unavailable for rc 2, got {other:?}"),
+        }
+
+        let second = capture.acquire_frame().expect("second frame");
+        assert_eq!(second.data.len(), (TEST_WIDTH * TEST_HEIGHT * 4) as usize);
+        for (i, pixel) in second.data.chunks_exact(4).enumerate() {
+            assert_eq!(pixel, [0, 0, 0, 255], "pixel {i} must stay opaque black");
+        }
+
+        // A later successful get that writes nothing finds a fully zeroed
+        // buffer: wholly-absent fires instead of rendering leftover bytes.
+        match frame_error(&mut capture) {
+            CaptureError::Unavailable(native) => {
+                assert_eq!(native.operation, "empty_histogram");
+            }
+            other => panic!("expected empty_histogram, got {other:?}"),
+        }
+    }
+
+    // 10. Construction clears a stale reinit request (session hygiene).
+    #[test]
+    fn construction_clears_a_stale_reinit_request() {
+        REINIT.store(true, Ordering::SeqCst);
+        let lib = FakeHistogramLib::new().with_fill(|entry| entry.channels[0] = 1);
+        let calls = lib.calls();
+        let mut capture = capture(lib);
+        assert!(
+            !capture.reinit_requested(),
+            "a fresh session must not inherit a dropped session's reinit request"
+        );
+        capture.acquire_frame().expect("frame");
+        assert_eq!(
+            *calls.borrow(),
+            ["init", "set_preset", "get"],
+            "no reinit may run on the first acquire"
         );
     }
 
