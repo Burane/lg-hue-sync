@@ -8,7 +8,8 @@ set -euo pipefail
 TV_IP="${1:?Usage: ./scripts/provision_luna.sh <tv-ip|local> [ssh-port]}"
 SSH_PORT="${2:-22}"
 
-SSH_OPTS="-p $SSH_PORT -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5"
+# Share the connection with the Makefile/deploy.sh so the password is asked once.
+SSH_OPTS="-p $SSH_PORT -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 -o ControlMaster=auto -o ControlPath=/tmp/lg-hue-sync-ssh-%r@%h:%p -o ControlPersist=5m"
 
 echo "[*] Provisioning Luna permissions for org.webosbrew.lg-hue-sync on $TV_IP:$SSH_PORT..."
 
