@@ -29,6 +29,29 @@ The dashboard's `/capture-patterns` page shows nominal SDR patches. Load it in t
 
 `test-capture --raw-nv12-stats` requires free vtCapture hardware and prints five central Y/Cb/Cr summaries plus the TV's read-only reported dynamic-range mode. It never saves full frames. Stop the daemon before each probe, then restart it even if the probe fails. Confirm the service is active again; the existing `make test-capture` target does not manage that lifecycle. The mode label is a TV output hint, not capture colour-space metadata. Do not change the fixed BT.601 decoder based on a mode label alone.
 
+## Histogram capture probe (webOS 24/25)
+
+```bash
+make test-histogram TV_IP=<tv-ip>
+```
+
+The target runs `lg-hue-sync test-capture --histogram-direct` on the TV over SSH and needs
+no config file. It opens `/dev/video60` directly, so the official Hue Sync service must be
+stopped first: the installed service unit handles this through its
+`Conflicts=com.lighting.huesync.service` declaration, and for a manual probe run
+`ssh root@<tv-ip> 'systemctl stop com.lighting.huesync.service'` beforehand and start it
+again afterwards. The node is single-open; with the service still holding it, the probe
+reports the device busy.
+
+Reading the output: each zone record carries 256 little-endian `u16` bins per R/G/B channel
+block, and the bin index is the level (0–255), so bin values are counts, not levels. Every
+iteration prints each zone's per-channel argmax and count-weighted mean level; the weighted
+mean is the statistic that feeds light colour.
+
+In the dashboard, **Capture source** selects `auto` (recommended), `frame`, or `histogram`
+and applies live; the status line under the control shows which backend is currently
+serving frames.
+
 ## Codex project setup
 
 Codex loads [`.codex/environments/environment.toml`](../.codex/environments/environment.toml) from this repository. It sets up new worktrees with `make setup` and adds actions to update dependencies, refresh Rust stable, validate/build, transfer to the TV, and clean Docker builds. Leave automatic worktree cleanup empty so reusable Docker caches survive.
@@ -88,6 +111,14 @@ Root SSH must already work; rooting is a separate owner action.
 
 The script installs the binary, Luna permissions, service unit, boot hook, and launcher package. It does not upload `config.json` unless `--with-config` is supplied explicitly.
 
+### Second TV (LG C5, webOS 24/25)
+
+The same binary and `TV_IP`-parametric tooling cover a second TV. A C5's **first** install
+must use the full `./scripts/deploy.sh <tv-ip>`: it installs the service unit declaring
+`Conflicts=com.lighting.huesync.service`, which frees the single-open histogram node from
+the official Hue Sync service. `make deploy-bin` alone uploads a binary and never rewrites
+the unit, so it cannot add that declaration to an existing installation.
+
 ### Ares transfer tools
 
 The official Rust rewrite is [`webosbrew/ares-cli-rs`](https://github.com/webosbrew/ares-cli-rs). This workstation keeps Node commands unchanged and exposes the verified Rust v0.7.0 binaries as `ares-rs-*` aliases. Upstream shares the OSE registry, but LG's Node TV CLI uses a separate `~/.webos/tv` registry here, so `lgc1` is registered in both.
@@ -110,6 +141,12 @@ make deploy-bin TV_IP=<tv-ip>
 ```
 
 The update retains `config.json`, backs up the previous binary, uploads through a temporary filename, and restarts the service.
+
+## One TV streams at a time
+
+A Hue Entertainment area has a single stream owner. When two TVs' daemons stream through
+one bridge — for example a C1 and a C5 sharing an area — they fight for ownership and
+output breaks. Keep one TV syncing at a time.
 
 ## Apple Shortcuts and presets
 

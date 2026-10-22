@@ -10,6 +10,7 @@ Native ambient-light synchronization for rooted LG webOS TVs. A Rust daemon capt
 ## Features
 
 - Root-only webOS capture through dynamically loaded `libvtcapture`/`dile_vt` APIs.
+- On webOS 24/25, a DRM-safe 16-zone histogram capture mode read directly from the video hardware, selectable through the dashboard's capture source setting (`auto`/`frame`/`histogram`).
 - Hue Entertainment API v2 over DTLS 1.2 PSK, including gradient member identity.
 - Nanoleaf 4D UDP streaming with 40-panel corner, direction, and offset alignment.
 - Independent Hue/Nanoleaf controls; TV sleep/wake following can be automatic or manual.
@@ -19,7 +20,7 @@ Native ambient-light synchronization for rooted LG webOS TVs. A Rust daemon capt
 ## Limits and safety
 
 - Root access is required. Rooting can void warranties or render a TV unusable; confirm model and firmware compatibility first.
-- DRM-protected native webOS apps may expose black capture surfaces. External HDMI playback is the reliable path for protected content.
+- On webOS 24/25, the histogram capture mode syncs DRM-protected native apps; this is verified on-device during protected playback. Older webOS still requires external HDMI playback for protected content.
 - Hue decides how physical gradient segments are grouped into Entertainment channels. This project streams the selected area's returned channels; it does not fabricate more.
 - LG private capture APIs and community root methods are unsupported by LG and may change with firmware.
 

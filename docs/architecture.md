@@ -51,6 +51,41 @@ and panel membership remain unchanged. Device modules
 retain only geometry and wire-protocol responsibilities. Failed output reconnections use the same
 bounded exponential-backoff policy so a disconnected device cannot trigger frame-rate retries.
 
+## Capture backends
+
+`src/capture/` serves two capture paths. Frame capture dynamically loads
+`libvtcapture`/`dile_vt` and remains the path for webOS releases older than 24. On
+webOS 24/25 a direct V4L2 histogram backend is also available, established by on-device
+probe evidence gathered on a C5: the daemon opens `/dev/video60` and drives three extended
+controls — `0x00982a14` (enable), `0x00982a15` (preset; presets 0–3 select zone counts of
+16/16/16/14), and `0x00982a16` (a payload read returning zones × 0x604-byte records, each
+an `i32` index followed by 3×256 little-endian `u16` histogram bins for the R, G, and B
+channels).
+
+The histogram path is DRM-safe: the video hardware computes the histograms upstream of the
+secure frame path, so the frame-dump blackout does not apply. Live, varied per-zone data
+was confirmed on-device during DRM-protected playback in a native app. Each zone's colour
+is the count-weighted mean bin level per channel — the bin index is the level, so the mean
+maps directly onto 0–255 — giving an RGB triple per zone. The sixteen triples are
+block-painted onto a 4×4 canvas consumed by the existing spatial sampling and per-light
+zone rectangles; no separate zone-mapping table exists.
+
+The `capture_backend` setting selects `frame`, `histogram`, or `auto` (the default). `auto`
+prefers frame capture and switches to histogram after 30 consecutive all-black frames
+(about a second at 30 fps, long enough to ride out ordinary fades to black). Failed switch
+attempts use exponential backoff — the required black streak doubles up to a cap of about
+64 seconds and resets only on a successful switch — so a TV without the node is not
+re-probed through every dark scene. The daemon returns to frame capture after four
+consecutive histogram `Unavailable` errors, or when the periodic frame probe — every 150
+frames of healthy histogram output — finds the frame chain healthy again.
+
+`/dev/video60` is single-open, and the official Hue Sync service holds it while active; the
+installed service unit therefore declares `Conflicts=com.lighting.huesync.service`, a no-op
+on TVs without that unit. The libvtcapture histogram API exists but is caller-gated: it
+whitelists the calling command line (with a dev-mode bypass at
+`/var/luna/preferences/vt_devmode`) and its resource-manager client requires a live LS2
+service context. The direct ioctls bypass both.
+
 ## Ownership boundaries
 
 - Hue app: Entertainment Area membership and physical 3D placement.
@@ -74,7 +109,7 @@ Hue v2 may group several physical gradient segments into one Entertainment chann
 
 [`webosbrew/webos-userland`](https://github.com/webosbrew/webos-userland/tree/main) provides community headers and stub libraries for LG userland APIs; its [generated reference](https://www.webosbrew.org/webos-userland/index.html) is useful when reviewing capture bindings. Treat availability and ABI behavior as firmware-specific and keep defensive dynamic loading and frame checks in `src/capture/`.
 
-[`HyperHDR`](https://github.com/awawa-dev/HyperHDR) is an ambient-light design reference. Its [colour engine](https://github.com/awawa-dev/HyperHDR/wiki/Infinite-color-engine) retains float precision through averaging, correction, and smoothing; its [LUT calibration](https://github.com/awawa-dev/HyperHDR/wiki/lut-calibration) first identifies the source conversion. This daemon currently assumes BT.601 limited-range NV12 in both capture paths, then repeatedly converts processing results to 8-bit RGB. Hue xy output linearizes sRGB, but Hue Direct RGB expands each 8-bit channel to 16 bits without restoring precision. The legacy `hdr_tone_mapping` setting lifts midtones in 8-bit RGB and has no capture transfer or HDR metadata; new configurations leave it off, while existing configurations preserve their setting. It is not a validated HDR10/Dolby Vision conversion.
+[`HyperHDR`](https://github.com/awawa-dev/HyperHDR) is an ambient-light design reference. Its [colour engine](https://github.com/awawa-dev/HyperHDR/wiki/Infinite-color-engine) retains float precision through averaging, correction, and smoothing; its [LUT calibration](https://github.com/awawa-dev/HyperHDR/wiki/lut-calibration) first identifies the source conversion. This daemon currently assumes BT.601 limited-range NV12 in both frame-capture paths, then repeatedly converts processing results to 8-bit RGB. Hue xy output linearizes sRGB, but Hue Direct RGB expands each 8-bit channel to 16 bits without restoring precision. The legacy `hdr_tone_mapping` setting lifts midtones in 8-bit RGB and has no capture transfer or HDR metadata; new configurations leave it off, while existing configurations preserve their setting. It is not a validated HDR10/Dolby Vision conversion.
 
 Colour investigation order:
 
