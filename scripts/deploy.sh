@@ -116,6 +116,12 @@ ExecStart=/bin/sh -c 'exec /var/home/root/lg-hue-sync/lg-hue-sync run --config /
 Restart=always
 RestartSec=5
 TimeoutStopSec=3
+# The sync loop pings the watchdog every pass; a native capture call that
+# never returns (libvtcapture's stop deadlocks on webOS 25 when a frame
+# session never produced a buffer) gets the daemon restarted instead of
+# silently freezing light output.
+NotifyAccess=main
+WatchdogSec=30
 
 [Install]
 WantedBy=multi-user.target
