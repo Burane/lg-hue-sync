@@ -241,6 +241,7 @@
     .toggle-desc { font-size: 0.75rem; color: var(--text-muted); }
     .switch { position: relative; width: 44px; height: 24px; }
     .switch input { opacity: 0; width: 0; height: 0; }
+    html.tv :focus, html.tv .switch input:focus + .slider { outline: 3px solid var(--focus-ring); outline-offset: 2px; }
     .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background: var(--track-bg); border-radius: 24px; transition: .2s; }
     .slider:before { position: absolute; content: ""; height: 18px; width: 18px; left: 3px; bottom: 3px; background: white; border-radius: 50%; transition: .2s; }
     input:checked + .slider { background: var(--accent); }
@@ -1025,6 +1026,26 @@
         try { await modelContext.registerTool(tool); }
         catch (error) { console.warn('WebMCP tool registration unavailable; dashboard controls remain usable.', error); }
       }
+    }
+
+    // webOS remote: up/down walk focus through visible controls in page order
+    // (scrolling them into view), left/right stay with sliders, Back exits.
+    if (navigator.userAgent.includes('Web0S')) {
+      document.documentElement.classList.add('tv');
+      const FOCUSABLE = 'button, input, select, textarea, summary, a[href]';
+      window.addEventListener('keydown', (event) => {
+        if (event.keyCode === 461) { window.close(); return; }
+        if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
+        const items = [...document.querySelectorAll(FOCUSABLE)]
+          .filter((el) => !el.disabled && el.offsetParent !== null);
+        if (!items.length) return;
+        event.preventDefault();
+        const step = event.key === 'ArrowDown' ? 1 : -1;
+        const current = items.indexOf(document.activeElement);
+        const next = current < 0 ? 0 : Math.min(items.length - 1, Math.max(0, current + step));
+        items[next].focus();
+        items[next].scrollIntoView({ block: 'center' });
+      });
     }
 
     // Initialize polling
